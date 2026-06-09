@@ -60,11 +60,48 @@ func newSimpleServer(v cert.Version, caCrt cert.Certificate, caKey []byte, name 
 	return newSimpleServerWithUdp(v, caCrt, caKey, name, sVpnNetworks, udpAddr, overrides)
 }
 
+// newSimpleServerWithCurve is newSimpleServer with an explicit node key curve,
+// used to bring up post-quantum (Curve_MLKEM1024) nodes in tests.
+func newSimpleServerWithCurve(curve cert.Curve, v cert.Version, caCrt cert.Certificate, caKey []byte, name string, sVpnNetworks string, overrides m) (*nebula.Control, []netip.Prefix, netip.AddrPort, *config.C) {
+	var vpnNetworks []netip.Prefix
+	for _, sn := range strings.Split(sVpnNetworks, ",") {
+		vpnIpNet, err := netip.ParsePrefix(strings.TrimSpace(sn))
+		if err != nil {
+			panic(err)
+		}
+		vpnNetworks = append(vpnNetworks, vpnIpNet)
+	}
+
+	if len(vpnNetworks) == 0 {
+		panic("no vpn networks")
+	}
+
+	var udpAddr netip.AddrPort
+	if vpnNetworks[0].Addr().Is4() {
+		budpIp := vpnNetworks[0].Addr().As4()
+		budpIp[1] -= 128
+		udpAddr = netip.AddrPortFrom(netip.AddrFrom4(budpIp), 4242)
+	} else {
+		budpIp := vpnNetworks[0].Addr().As16()
+		budpIp[2] = 190
+		budpIp[3] = 239
+		udpAddr = netip.AddrPortFrom(netip.AddrFrom16(budpIp), 4242)
+	}
+	return newSimpleServerWithUdpAndUnsafeNetworksCurve(curve, v, caCrt, caKey, name, sVpnNetworks, udpAddr, "", overrides)
+}
+
 func newSimpleServerWithUdp(v cert.Version, caCrt cert.Certificate, caKey []byte, name string, sVpnNetworks string, udpAddr netip.AddrPort, overrides m) (*nebula.Control, []netip.Prefix, netip.AddrPort, *config.C) {
 	return newSimpleServerWithUdpAndUnsafeNetworks(v, caCrt, caKey, name, sVpnNetworks, udpAddr, "", overrides)
 }
 
 func newSimpleServerWithUdpAndUnsafeNetworks(v cert.Version, caCrt cert.Certificate, caKey []byte, name string, sVpnNetworks string, udpAddr netip.AddrPort, sUnsafeNetworks string, overrides m) (*nebula.Control, []netip.Prefix, netip.AddrPort, *config.C) {
+	return newSimpleServerWithUdpAndUnsafeNetworksCurve(cert.Curve_CURVE25519, v, caCrt, caKey, name, sVpnNetworks, udpAddr, sUnsafeNetworks, overrides)
+}
+
+// newSimpleServerWithUdpAndUnsafeNetworksCurve is the curve-aware leaf builder.
+// The node key's curve selects the handshake: a Curve_MLKEM1024 node uses the
+// post-quantum pqIX handshake, classical curves use Noise IX.
+func newSimpleServerWithUdpAndUnsafeNetworksCurve(curve cert.Curve, v cert.Version, caCrt cert.Certificate, caKey []byte, name string, sVpnNetworks string, udpAddr netip.AddrPort, sUnsafeNetworks string, overrides m) (*nebula.Control, []netip.Prefix, netip.AddrPort, *config.C) {
 	l := NewTestLogger()
 
 	var vpnNetworks []netip.Prefix
@@ -104,7 +141,7 @@ func newSimpleServerWithUdpAndUnsafeNetworks(v cert.Version, caCrt cert.Certific
 		}
 	}
 
-	_, _, myPrivKey, myPEM := cert_test.NewTestCert(v, cert.Curve_CURVE25519, caCrt, caKey, name, time.Now(), time.Now().Add(5*time.Minute), vpnNetworks, unsafeNetworks, []string{})
+	_, _, myPrivKey, myPEM := cert_test.NewTestCert(v, curve, caCrt, caKey, name, time.Now(), time.Now().Add(5*time.Minute), vpnNetworks, unsafeNetworks, []string{})
 
 	caB, err := caCrt.MarshalPEM()
 	if err != nil {

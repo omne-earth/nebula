@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudflare/circl/kem/mlkem/mlkem1024"
 	"github.com/skip2/go-qrcode"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/pkclient"
@@ -268,6 +269,13 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 		}(p11Client)
 	}
 
+	// The node key type may differ from the CA signing key type: a post-quantum
+	// ML-DSA-87 CA signs ML-KEM-1024 node certs. For the classical curves they match.
+	nodeCurve := curve
+	if curve == cert.Curve_MLDSA87 {
+		nodeCurve = cert.Curve_MLKEM1024
+	}
+
 	if *sf.inPubPath != "" {
 		var pubCurve cert.Curve
 		rawPub, err := readInput("in-pub", *sf.inPubPath, &claims)
@@ -279,8 +287,8 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 		if err != nil {
 			return fmt.Errorf("error while parsing in-pub: %s", err)
 		}
-		if pubCurve != curve {
-			return fmt.Errorf("curve of in-pub does not match ca")
+		if pubCurve != nodeCurve {
+			return fmt.Errorf("curve of in-pub (%s) does not match the node key type for this ca", pubCurve)
 		}
 	} else if isP11 {
 		pub, err = p11Client.GetPubKey()
@@ -288,7 +296,7 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 			return fmt.Errorf("error while getting public key with PKCS#11: %w", err)
 		}
 	} else {
-		pub, rawPriv = newKeypair(curve)
+		pub, rawPriv = newKeypair(nodeCurve)
 	}
 
 	if !isStdio(*sf.outCertPath) {
@@ -327,7 +335,7 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 			NotAfter:       notAfter,
 			PublicKey:      pub,
 			IsCA:           false,
-			Curve:          curve,
+			Curve:          nodeCurve,
 		}
 
 		var nc cert.Certificate
@@ -356,7 +364,7 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 			NotAfter:       notAfter,
 			PublicKey:      pub,
 			IsCA:           false,
-			Curve:          curve,
+			Curve:          nodeCurve,
 		}
 
 		var nc cert.Certificate
@@ -385,7 +393,7 @@ func signCert(args []string, out io.Writer, errOut io.Writer, pr PasswordReader)
 			}
 		}
 
-		err = writeOutput(*sf.outKeyPath, cert.MarshalPrivateKeyToPEM(curve, rawPriv), 0600, out)
+		err = writeOutput(*sf.outKeyPath, cert.MarshalPrivateKeyToPEM(nodeCurve, rawPriv), 0600, out)
 		if err != nil {
 			return fmt.Errorf("error while writing out-key: %s", err)
 		}
@@ -426,9 +434,29 @@ func newKeypair(curve cert.Curve) ([]byte, []byte) {
 		return x25519Keypair()
 	case cert.Curve_P256:
 		return p256Keypair()
+	case cert.Curve_MLKEM1024:
+		return mlkem1024Keypair()
 	default:
 		return nil, nil
 	}
+}
+
+// mlkem1024Keypair generates a post-quantum node static (handshake) keypair, returning
+// the CIRCL-encoded (public, private) bytes.
+func mlkem1024Keypair() ([]byte, []byte) {
+	pub, priv, err := mlkem1024.Scheme().GenerateKeyPair()
+	if err != nil {
+		panic(err)
+	}
+	pubB, err := pub.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	privB, err := priv.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	return pubB, privB
 }
 
 func x25519Keypair() ([]byte, []byte) {

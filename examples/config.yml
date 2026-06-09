@@ -197,28 +197,25 @@ punchy:
 # This setting is reloadable.
 #preferred_ranges: ["172.16.0.0/24"]
 
-# sshd can expose informational and administrative functions via ssh. This can expose informational and administrative
-# functions, and allows manual tweaking of various network settings when debugging or testing.
-#sshd:
-  # Toggles the feature
-  #enabled: true
-  # Host and port to listen on, port 22 is not allowed for your safety
-  #listen: 127.0.0.1:2222
-  # A file containing the ssh host private key to use
-  # A decent way to generate one: ssh-keygen -t ed25519 -f ssh_host_ed25519_key -N "" < /dev/null
-  #host_key: ./ssh_host_ed25519_key
-  # Authorized users and their public keys
-  #authorized_users:
-    #- user: steeeeve
-      # keys can be an array of strings or single string
-      #keys:
-        #- "ssh public key string"
-  # Trusted SSH CA public keys. These are the public keys of the CAs that are allowed to sign SSH keys for access.
-  #trusted_cas:
-    #- "ssh public key string"
-  # sandbox_dir restricts file paths for profiling commands (start-cpu-profile, save-heap-profile,
-  # save-mutex-profile) to the specified directory. Relative paths will be resolved within this directory,
-  # and absolute paths outside of it will be rejected. Default is $TMP/nebula-debug.
+# control exposes the same informational and administrative functions the embedded sshd used
+# to (list-hostmap, close-tunnel, reload, the pprof commands, ...) over a LOCAL unix-domain
+# control socket, driven by `nebula ctl <command>` - the default, qp-ssh-free control plane.
+# Command names are unchanged: `nebula ctl list-hostmap`, `nebula ctl close-tunnel <ip>`, etc.
+# For REMOTE access, forward the socket over qp-ssh (no ssh server runs in nebula):
+#   qp-ssh -L /tmp/neb.sock:/run/nebula.sock admin@node
+#   nebula ctl -socket /tmp/neb.sock list-hostmap
+# The legacy embedded ssh server is compiled out of the default build; restore it with
+# `go build -tags sshd` (it reads the old `sshd:` block, which this replaces).
+#control:
+  # Path to the unix-domain control socket. Unset/empty disables the control plane.
+  #socket: /run/nebula.sock
+  # Socket file mode - the local authorization gate. Default 0660.
+  #mode: 0660
+  # Group owner of the socket; members of this group may talk to it. Default "nebula".
+  #group: nebula
+  # sandbox_dir restricts file paths for the profiling commands (start-cpu-profile,
+  # save-heap-profile, save-mutex-profile) to the specified directory. Relative paths resolve
+  # within it; absolute paths outside it are rejected. Default is $TMP/nebula-debug.
   # The directory is NOT automatically created.
   # Overriding this to "" is the same as "/" and will allow overwriting any path on the host.
   #sandbox_dir: /var/tmp/nebula-debug

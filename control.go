@@ -50,6 +50,7 @@ type Control struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	sshStart               func()
+	controlSocketStart     func()
 	statsStart             func()
 	dnsStart               func()
 	lighthouseStart        func()
@@ -97,6 +98,9 @@ func (c *Control) Start() (func() error, error) {
 	// Call all the delayed funcs that waited patiently for the interface to be created.
 	if c.sshStart != nil {
 		go c.sshStart()
+	}
+	if c.controlSocketStart != nil {
+		go c.controlSocketStart()
 	}
 	if c.statsStart != nil {
 		go c.statsStart()

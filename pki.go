@@ -248,6 +248,12 @@ func newCipherSuite(curve cert.Curve, pkcs11backed bool, cipher string) (noise.C
 		} else {
 			dhFunc = noiseutil.DHP256
 		}
+	case cert.Curve_MLKEM1024:
+		// A KEM cannot be a noise DHFunc (encapsulation emits a ciphertext that
+		// must be transmitted; DH has no such channel - see FORK.md sec 3). The
+		// post-quantum credential carries no noise cipher suite: the handshake
+		// engine is the pqEngine, selected by curve in handshake.buildEngine.
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("unsupported curve: %s", curve)
 	}

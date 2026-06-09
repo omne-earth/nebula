@@ -32,18 +32,17 @@ var subtypeInfos = map[header.MessageSubType]subtypeInfo{
 		},
 	},
 
-	// XX: 3 messages
-	//   msg1 (I->R): payload only
-	//   msg2 (R->I): payload + cert
-	//   msg3 (I->R): cert only
-	//header.HandshakeXXPSK0: {
-	//	pattern: noise.HandshakeXX,
-	//	msgs: []msgFlags{
-	//		{expectsPayload: true, expectsCert: false},
-	//		{expectsPayload: true, expectsCert: true},
-	//		{expectsPayload: false, expectsCert: true},
-	//	},
-	//},
+	// pqIX: 3 messages over ML-KEM-1024 (qp-nebula). msg1 and msg2 carry payload + cert
+	// (statics and certs are exchanged in-band); msg3 completes - the initiator already
+	// sent its cert in msg1, and both indexes are exchanged by msg2. There is no noise
+	// pattern: the engine is selected by the credential's ML-KEM curve, not a DH pattern.
+	header.HandshakePQIX: {
+		msgs: []msgFlags{
+			{expectsPayload: true, expectsCert: true},
+			{expectsPayload: true, expectsCert: true},
+			{expectsPayload: false, expectsCert: false},
+		},
+	},
 }
 
 func subtypeInfoFor(subtype header.MessageSubType) (subtypeInfo, error) {

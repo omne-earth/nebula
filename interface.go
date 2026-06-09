@@ -23,7 +23,11 @@ import (
 	"github.com/slackhq/nebula/udp"
 )
 
-const mtu = 9001
+// mtu sizes the tun read and data-plane/SendVia scratch buffers. It is kept in
+// step with udp.MTU so the relay-forward path (SendVia) can carry a full
+// post-quantum pqIX handshake message (~11 KB, see udp.MTU). Data-plane packets
+// remain bounded by the tun MTU; this is just buffer headroom.
+const mtu = 16384
 
 type InterfaceConfig struct {
 	HostMap            *HostMap

@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/control"
 	"github.com/slackhq/nebula/overlay"
-	"github.com/slackhq/nebula/sshd"
 	"github.com/slackhq/nebula/udp"
 	"github.com/slackhq/nebula/util"
 	"go.yaml.in/yaml/v3"
@@ -55,7 +55,11 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 	}
 	l.Info("Firewall started", "firewallHashes", fw.GetRuleHashes())
 
-	ssh, err := sshd.NewSSHServer(ctx, l.With("subsystem", "sshd"))
+	// The transport-neutral control registry. Populated by attachCommands once the Interface
+	// is up (below); served by the embedded sshd (-tags sshd) and, in time, the control socket.
+	controlReg := control.NewRegistry()
+
+	ssh, err := newSSHControl(ctx, l.With("subsystem", "sshd"), controlReg)
 	if err != nil {
 		return nil, util.ContextualizeIfNeeded("Error while creating SSH server", err)
 	}
@@ -255,7 +259,16 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 
 	go ifce.emitStats(ctx, c.GetDuration("stats.interval", time.Second*10))
 
-	attachCommands(l, c, ssh, ifce)
+	attachCommands(l, c, controlReg, ifce)
+
+	// Local control socket: the default transport over the registry (the embedded sshd, under
+	// -tags sshd, is the alternative). Built after attachCommands so it serves the full set;
+	// ctx-scoped so it tears down on Control.Stop. Disabled unless control.socket is set.
+	controlSocketStart, err := configControlSocket(ctx, l, controlReg, c)
+	if err != nil {
+		l.Warn("Failed to configure the control socket", "error", err)
+		controlSocketStart = nil
+	}
 
 	return &Control{
 		state:                  StateReady,
@@ -264,6 +277,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		ctx:                    ctx,
 		cancel:                 cancel,
 		sshStart:               sshStart,
+		controlSocketStart:     controlSocketStart,
 		statsStart:             stats.Start,
 		dnsStart:               ds.Start,
 		lighthouseStart:        lightHouse.StartUpdateWorker,

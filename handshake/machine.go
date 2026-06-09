@@ -6,9 +6,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/flynn/noise"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/noiseutil"
 )
 
 // IndexAllocator is called by the Machine to allocate a local index for the
@@ -29,9 +29,8 @@ type CertVerifier func(cert.Certificate) (*cert.CachedCertificate, error)
 // Result contains the results of a successful handshake.
 // Returned by ProcessPacket when the handshake is complete.
 type Result struct {
-	EKey          *noise.CipherState
-	DKey          *noise.CipherState
-	Cipher        noise.CipherFunc // identifies which post-handshake CipherState the data plane should wrap EKey/DKey in
+	EKey          noiseutil.CipherState
+	DKey          noiseutil.CipherState
 	MyCert        cert.Certificate
 	RemoteCert    *cert.CachedCertificate
 	RemoteIndex   uint32
@@ -55,7 +54,7 @@ type Result struct {
 // retransmit) and the Machine can accept another packet. If Failed() is
 // true the Machine is unrecoverable and the caller must abandon it.
 type Machine struct {
-	hs             *noise.HandshakeState
+	hs             handshakeEngine
 	getCred        GetCredentialFunc
 	allocIndex     IndexAllocator
 	verifier       CertVerifier
@@ -91,13 +90,13 @@ func NewMachine(
 		return nil, fmt.Errorf("%w: %v", ErrNoCredential, version)
 	}
 
-	hs, err := cred.buildHandshakeState(initiator, info.pattern)
+	eng, err := buildEngine(cred, initiator, info)
 	if err != nil {
-		return nil, fmt.Errorf("build noise state: %w", err)
+		return nil, err
 	}
 
 	return &Machine{
-		hs:         hs,
+		hs:         eng,
 		subtype:    subtype,
 		msgs:       info.msgs,
 		getCred:    getCred,
@@ -106,7 +105,6 @@ func NewMachine(
 		myVersion:  version,
 		result: &Result{
 			Initiator: initiator,
-			Cipher:    cred.cipherSuite,
 		},
 	}, nil
 }
@@ -220,12 +218,11 @@ func (m *Machine) ProcessPacket(out, packet []byte) ([]byte, *Result, error) {
 		return nil, nil, ErrInitiateNotCalled
 	}
 
-	// The (eKey, dKey) ordering here is correct for IX, where the initiator
-	// completes the handshake by reading the responder's stage-2 message.
-	// noise returns (cs1, cs2) where cs1 is the initiator->responder cipher.
-	// For 3-message patterns where a responder finishes by reading the final
-	// message, this ordering would be wrong; revisit when XX/pqIX lands.
-	msg, eKey, dKey, err := m.hs.ReadMessage(nil, packet[header.Len:])
+	// The engine returns the transport key pair (cs1, cs2) = (initiator->responder,
+	// responder->initiator) on the final message. completed() maps them to this peer's
+	// (EKey, DKey) by role, so it is correct whether the initiator finishes by reading
+	// (IX) or by writing (pqIX).
+	msg, cs1, cs2, err := m.hs.ReadMessage(nil, packet[header.Len:])
 	if err != nil {
 		// Noise ReadMessage failed. The noise library checkpoints and rolls back
 		// on failure, so the Machine is still alive. The caller can retry with
@@ -243,41 +240,50 @@ func (m *Machine) ProcessPacket(out, packet []byte) ([]byte, *Result, error) {
 	// If ReadMessage derived keys, the handshake is complete. Noise should
 	// always produce both keys together; asymmetry is a protocol invariant
 	// violation.
-	if eKey != nil || dKey != nil {
-		if eKey == nil || dKey == nil {
+	if cs1 != nil || cs2 != nil {
+		if cs1 == nil || cs2 == nil {
 			m.failed = true
 			return nil, nil, ErrAsymmetricCipherKeys
 		}
 		if err := m.requireComplete(); err != nil {
 			return nil, nil, err
 		}
-		return nil, m.completed(eKey, dKey), nil
+		return nil, m.completed(cs1, cs2), nil
 	}
 
 	// ReadMessage didn't complete, produce the next outgoing message
-	out, dk, ek, err := m.buildResponse(out)
+	out, wcs1, wcs2, err := m.buildResponse(out)
 	if err != nil {
 		m.failed = true
 		return nil, nil, err
 	}
 
-	if ek != nil || dk != nil {
-		if ek == nil || dk == nil {
+	if wcs1 != nil || wcs2 != nil {
+		if wcs1 == nil || wcs2 == nil {
 			m.failed = true
 			return nil, nil, ErrAsymmetricCipherKeys
 		}
 		if err := m.requireComplete(); err != nil {
 			return nil, nil, err
 		}
-		return out, m.completed(ek, dk), nil
+		return out, m.completed(wcs1, wcs2), nil
 	}
 
 	return out, nil, nil
 }
 
-func (m *Machine) completed(eKey, dKey *noise.CipherState) *Result {
-	m.result.EKey = eKey
-	m.result.DKey = dKey
+// completed maps the engine's transport key pair (cs1, cs2) = (initiator->responder,
+// responder->initiator) to this peer's encrypt/decrypt keys by role: the initiator
+// encrypts on i2r and decrypts on r2i; the responder is the mirror. This is correct for
+// both IX (initiator finishes by reading) and pqIX (initiator finishes by writing).
+func (m *Machine) completed(cs1, cs2 noiseutil.CipherState) *Result {
+	if m.result.Initiator {
+		m.result.EKey = cs1
+		m.result.DKey = cs2
+	} else {
+		m.result.EKey = cs2
+		m.result.DKey = cs1
+	}
 	m.result.MessageIndex = uint64(m.hs.MessageIndex())
 	return m.result
 }
@@ -408,7 +414,7 @@ func (m *Machine) marshalOutgoing(flags msgFlags) ([]byte, error) {
 	return MarshalPayload(nil, p), nil
 }
 
-func (m *Machine) buildResponse(out []byte) ([]byte, *noise.CipherState, *noise.CipherState, error) {
+func (m *Machine) buildResponse(out []byte) ([]byte, noiseutil.CipherState, noiseutil.CipherState, error) {
 	flags := m.myMsgFlags()
 	hsBytes, err := m.marshalOutgoing(flags)
 	if err != nil {
@@ -428,19 +434,14 @@ func (m *Machine) buildResponse(out []byte) ([]byte, *noise.CipherState, *noise.
 		uint64(m.hs.MessageIndex()+1),
 	)
 
-	// noise.WriteMessage appends the encrypted handshake message to out,
-	// reusing capacity when present.
-	//
-	// The (dKey, eKey) ordering here is correct for IX, where the responder
-	// completes the handshake by writing the stage-2 message. noise returns
-	// (cs1, cs2) where cs1 is the initiator->responder cipher (which is the
-	// responder's decrypt key). For 3-message patterns where an initiator
-	// finishes by writing the final message, this ordering would be wrong;
-	// revisit when XX/pqIX lands.
-	out, dKey, eKey, err := m.hs.WriteMessage(out, hsBytes)
+	// WriteMessage appends the encrypted handshake message to out, reusing capacity
+	// when present. It returns the raw transport key pair (cs1, cs2) =
+	// (initiator->responder, responder->initiator) on the final message; completed()
+	// maps them to EKey/DKey by role.
+	out, cs1, cs2, err := m.hs.WriteMessage(out, hsBytes)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("noise WriteMessage: %w", err)
+		return nil, nil, nil, fmt.Errorf("write handshake message: %w", err)
 	}
 
-	return out, dKey, eKey, nil
+	return out, cs1, cs2, nil
 }

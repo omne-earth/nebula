@@ -1,37 +1,41 @@
+//go:build sshd
+
 package sshd
 
 import (
-	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 
+	"log/slog"
+
 	"github.com/anmitsu/go-shlex"
-	"github.com/armon/go-radix"
+	"github.com/slackhq/nebula/control"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
 
 type session struct {
-	l        *slog.Logger
-	c        *ssh.ServerConn
-	term     *term.Terminal
-	commands *radix.Tree
-	cancel   func()
+	l      *slog.Logger
+	c      *ssh.ServerConn
+	term   *term.Terminal
+	reg    *control.Registry
+	cancel func()
 }
 
-func NewSession(commands *radix.Tree, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, cancel func(), l *slog.Logger) *session {
+func NewSession(reg *control.Registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, cancel func(), l *slog.Logger) *session {
+	// Per-session copy so the connection-scoped `logout` command does not leak into the
+	// shared registry (or other transports).
 	s := &session{
-		commands: radix.NewFromMap(commands.ToMap()),
-		l:        l,
-		c:        conn,
-		cancel:   cancel,
+		reg:    reg.Clone(),
+		l:      l,
+		c:      conn,
+		cancel: cancel,
 	}
 
-	s.commands.Insert("logout", &Command{
+	s.reg.Register(&control.Command{
 		Name:             "logout",
 		ShortDescription: "Ends the current session",
-		Callback: func(a any, args []string, w StringWriter) error {
+		Callback: func(a any, args []string, w control.StringWriter) error {
 			s.Close()
 			return nil
 		},
@@ -87,7 +91,7 @@ func (s *session) handleRequests(in <-chan *ssh.Request, channel ssh.Channel) {
 			}
 
 			req.Reply(true, nil)
-			s.dispatchCommand(payload.Value, &stringWriter{channel})
+			s.dispatchCommand(payload.Value, control.NewStringWriter(channel))
 
 			status := struct{ Status uint32 }{uint32(0)}
 			channel.SendRequest("exit-status", false, ssh.Marshal(status))
@@ -111,7 +115,7 @@ func (s *session) createTerm(channel ssh.Channel) *term.Terminal {
 	term.AutoCompleteCallback = func(line string, pos int, key rune) (newLine string, newPos int, ok bool) {
 		// key 9 is tab
 		if key == 9 {
-			cmds := matchCommand(s.commands, line)
+			cmds := s.reg.Match(line)
 			if len(cmds) == 1 {
 				return cmds[0] + " ", len(cmds[0]) + 1, true
 			}
@@ -128,7 +132,7 @@ func (s *session) createTerm(channel ssh.Channel) *term.Terminal {
 }
 
 func (s *session) handleInput() {
-	w := &stringWriter{w: s.term}
+	w := control.NewStringWriter(s.term)
 	for {
 		line, err := s.term.ReadLine()
 		if err != nil {
@@ -139,36 +143,15 @@ func (s *session) handleInput() {
 	}
 }
 
-func (s *session) dispatchCommand(line string, w StringWriter) {
+// dispatchCommand splits an ssh request line into argv and hands it to the registry, which
+// owns lookup/help/exec. The transport's only job is line -> argv (shlex) + the writer.
+func (s *session) dispatchCommand(line string, w control.StringWriter) {
 	args, err := shlex.Split(line, true)
 	if err != nil {
 		return
 	}
 
-	if len(args) == 0 {
-		dumpCommands(s.commands, w)
-		return
-	}
-
-	c, err := lookupCommand(s.commands, args[0])
-	if err != nil {
-		return
-	}
-
-	if c == nil {
-		err := w.WriteLine(fmt.Sprintf("did not understand: %s", line))
-		_ = err
-
-		dumpCommands(s.commands, w)
-		return
-	}
-
-	if checkHelpArgs(args) {
-		s.dispatchCommand(fmt.Sprintf("%s %s", "help", c.Name), w)
-		return
-	}
-
-	_ = execCommand(c, args[1:], w)
+	_ = s.reg.Dispatch(args, w)
 }
 
 func (s *session) Close() {

@@ -32,8 +32,8 @@ func newConnectionStateFromResult(r *handshake.Result) *ConnectionState {
 		myCert:    r.MyCert,
 		initiator: r.Initiator,
 		peerCert:  r.RemoteCert,
-		eKey:      noiseutil.NewCipherState(r.EKey, r.Cipher),
-		dKey:      noiseutil.NewCipherState(r.DKey, r.Cipher),
+		eKey:      r.EKey,
+		dKey:      r.DKey,
 		window:    NewBits(ReplayWindow),
 	}
 	ci.messageCounter.Add(r.MessageIndex)

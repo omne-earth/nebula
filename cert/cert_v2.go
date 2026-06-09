@@ -162,6 +162,11 @@ func (c *certificateV2) CheckSignature(key []byte) bool {
 		}
 		hashed := sha256.Sum256(b)
 		return ecdsa.VerifyASN1(pubKey, hashed[:], c.signature)
+	case Curve_MLKEM1024, Curve_MLDSA87:
+		// Both post-quantum cert kinds are signed by an ML-DSA-87 CA; key is that
+		// CA's ML-DSA-87 public key. (The subject's own ML-KEM-1024 key is a KEM and
+		// is never used to verify - it is the handshake static key.)
+		return pqVerify(key, b, c.signature)
 	default:
 		return false
 	}
@@ -195,6 +200,14 @@ func (c *certificateV2) VerifyPrivateKey(curve Curve, key []byte) error {
 			if !bytes.Equal(pub, c.publicKey) {
 				return ErrPublicPrivateKeyMismatch
 			}
+		case Curve_MLDSA87:
+			pub, err := pqMLDSAPublicFromPrivate(key)
+			if err != nil {
+				return ErrInvalidPrivateKey
+			}
+			if !bytes.Equal(pub, c.publicKey) {
+				return ErrPublicPrivateKeyMismatch
+			}
 		default:
 			return fmt.Errorf("invalid curve: %s", curve)
 		}
@@ -215,6 +228,12 @@ func (c *certificateV2) VerifyPrivateKey(curve Curve, key []byte) error {
 			return ErrInvalidPrivateKey
 		}
 		pub = privkey.PublicKey().Bytes()
+	case Curve_MLKEM1024:
+		var err error
+		pub, err = pqMLKEMPublicFromPrivate(key)
+		if err != nil {
+			return ErrInvalidPrivateKey
+		}
 	default:
 		return fmt.Errorf("invalid curve: %s", curve)
 	}

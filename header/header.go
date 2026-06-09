@@ -62,6 +62,8 @@ const (
 const (
 	HandshakeIXPSK0 MessageSubType = 0
 	HandshakeXXPSK0 MessageSubType = 1
+	// HandshakePQIX is the post-quantum 3-message pqIX-analog over ML-KEM-1024 (qp-nebula).
+	HandshakePQIX MessageSubType = 2
 )
 
 var ErrHeaderTooShort = errors.New("header is too short")
@@ -84,6 +86,7 @@ var subTypeMap = map[MessageType]*map[MessageSubType]string{
 	CloseTunnel: &subTypeNoneMap,
 	Handshake: {
 		HandshakeIXPSK0: "ix_psk0",
+		HandshakePQIX:   "pqix",
 	},
 	Control: &subTypeNoneMap,
 }

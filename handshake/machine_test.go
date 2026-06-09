@@ -36,15 +36,15 @@ func TestMachineIXHappyPath(t *testing.T) {
 	assert.Equal(t, uint64(2), initR.MessageIndex, "IX has 2 messages")
 	assert.Equal(t, uint64(2), respR.MessageIndex, "IX has 2 messages")
 
-	ct1, err := initR.EKey.Encrypt(nil, nil, []byte("hello"))
+	ct1, err := initR.EKey.EncryptDanger(nil, nil, []byte("hello"), 0, make([]byte, 12))
 	require.NoError(t, err)
-	pt1, err := respR.DKey.Decrypt(nil, nil, ct1)
+	pt1, err := respR.DKey.DecryptDanger(nil, nil, ct1, 0, make([]byte, 12))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("hello"), pt1)
 
-	ct2, err := respR.EKey.Encrypt(nil, nil, []byte("world"))
+	ct2, err := respR.EKey.EncryptDanger(nil, nil, []byte("world"), 0, make([]byte, 12))
 	require.NoError(t, err)
-	pt2, err := initR.DKey.Decrypt(nil, nil, ct2)
+	pt2, err := initR.DKey.DecryptDanger(nil, nil, ct2, 0, make([]byte, 12))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("world"), pt2)
 }
@@ -294,15 +294,15 @@ func TestMachineAESCipher(t *testing.T) {
 
 	initR, respR := doFullHandshake(t, initCS, respCS, caPool)
 
-	ct1, err := initR.EKey.Encrypt(nil, nil, []byte("works"))
+	ct1, err := initR.EKey.EncryptDanger(nil, nil, []byte("works"), 0, make([]byte, 12))
 	require.NoError(t, err)
-	pt1, err := respR.DKey.Decrypt(nil, nil, ct1)
+	pt1, err := respR.DKey.DecryptDanger(nil, nil, ct1, 0, make([]byte, 12))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("works"), pt1)
 
-	ct2, err := respR.EKey.Encrypt(nil, nil, []byte("back"))
+	ct2, err := respR.EKey.EncryptDanger(nil, nil, []byte("back"), 0, make([]byte, 12))
 	require.NoError(t, err)
-	pt2, err := initR.DKey.Decrypt(nil, nil, ct2)
+	pt2, err := initR.DKey.DecryptDanger(nil, nil, ct2, 0, make([]byte, 12))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("back"), pt2)
 }
@@ -466,9 +466,9 @@ func TestMachineThreeMessagePattern(t *testing.T) {
 	assert.Equal(t, uint64(3), respResult.MessageIndex, "XX has 3 messages")
 
 	// Verify keys work
-	ct1, err := initResult.EKey.Encrypt(nil, nil, []byte("three messages"))
+	ct1, err := initResult.EKey.EncryptDanger(nil, nil, []byte("three messages"), 0, make([]byte, 12))
 	require.NoError(t, err)
-	pt1, err := respResult.DKey.Decrypt(nil, nil, ct1)
+	pt1, err := respResult.DKey.DecryptDanger(nil, nil, ct1, 0, make([]byte, 12))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("three messages"), pt1)
 }

@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/cloudflare/circl/kem/mlkem/mlkem1024"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/slackhq/nebula/cert"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/ed25519"
@@ -36,6 +38,13 @@ func NewTestCaCert(version cert.Version, curve cert.Curve, before, after time.Ti
 
 		pub = elliptic.Marshal(elliptic.P256(), privk.PublicKey.X, privk.PublicKey.Y)
 		priv = privk.D.FillBytes(make([]byte, 32))
+	case cert.Curve_MLDSA87:
+		pk, sk, e := mldsa87.GenerateKey(rand.Reader)
+		if e != nil {
+			panic(e)
+		}
+		pub, _ = pk.MarshalBinary()
+		priv, _ = sk.MarshalBinary()
 	default:
 		// There is no default to allow the underlying lib to respond with an error
 	}
@@ -90,6 +99,13 @@ func NewTestCert(v cert.Version, curve cert.Curve, ca cert.Certificate, key []by
 		pub, priv = X25519Keypair()
 	case cert.Curve_P256:
 		pub, priv = P256Keypair()
+	case cert.Curve_MLKEM1024:
+		pk, sk, e := mlkem1024.Scheme().GenerateKeyPair()
+		if e != nil {
+			panic(e)
+		}
+		pub, _ = pk.MarshalBinary()
+		priv, _ = sk.MarshalBinary()
 	default:
 		panic("unknown curve")
 	}

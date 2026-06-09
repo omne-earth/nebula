@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/skip2/go-qrcode"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/pkclient"
@@ -59,7 +60,7 @@ func newCaFlags() *caFlags {
 	cf.argonParallelism = cf.set.Uint("argon-parallelism", 4, "Optional: Argon2 parallelism parameter used for encrypted private key passphrase")
 	cf.argonIterations = cf.set.Uint("argon-iterations", 1, "Optional: Argon2 iterations parameter used for encrypted private key passphrase")
 	cf.encryption = cf.set.Bool("encrypt", false, "Optional: prompt for passphrase and write out-key in an encrypted format")
-	cf.curve = cf.set.String("curve", "25519", "EdDSA/ECDSA Curve (25519, P256)")
+	cf.curve = cf.set.String("curve", "25519", "EdDSA/ECDSA Curve (25519, P256, MLDSA87)")
 	cf.p11url = p11Flag(cf.set)
 
 	cf.ips = cf.set.String("ips", "", "Deprecated, see -networks")
@@ -265,6 +266,22 @@ func ca(args []string, out io.Writer, errOut io.Writer, pr PasswordReader) error
 			}
 			rawPriv = eKey.Bytes()
 			pub = eKey.PublicKey().Bytes()
+		case "MLDSA87":
+			curve = cert.Curve_MLDSA87
+			var caPub *mldsa87.PublicKey
+			var caPriv *mldsa87.PrivateKey
+			caPub, caPriv, err = mldsa87.GenerateKey(rand.Reader)
+			if err != nil {
+				return fmt.Errorf("error while generating ML-DSA-87 keys: %s", err)
+			}
+			pub, err = caPub.MarshalBinary()
+			if err != nil {
+				return fmt.Errorf("error while marshaling ML-DSA-87 public key: %s", err)
+			}
+			rawPriv, err = caPriv.MarshalBinary()
+			if err != nil {
+				return fmt.Errorf("error while marshaling ML-DSA-87 private key: %s", err)
+			}
 		default:
 			return fmt.Errorf("invalid curve: %s", *cf.curve)
 		}

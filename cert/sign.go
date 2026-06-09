@@ -47,7 +47,11 @@ type SignerLambda func(certBytes []byte) ([]byte, error)
 // details do not violate constraints of the signing certificate.
 // If the TBSCertificate is a CA then signer must be nil.
 func (t *TBSCertificate) Sign(signer Certificate, curve Curve, key []byte) (Certificate, error) {
-	switch t.Curve {
+	// Dispatch on the SIGNING key's curve, not the cert's subject curve: a
+	// post-quantum node cert (Curve_MLKEM1024) is signed by an ML-DSA-87 CA, so the
+	// signature algorithm is determined by the signer, not the subject. For the
+	// classical curves the two are equal (enforced by SignWith), so this is a no-op.
+	switch curve {
 	case Curve_CURVE25519:
 		pk := ed25519.PrivateKey(key)
 		sp := func(certBytes []byte) ([]byte, error) {
@@ -67,16 +71,21 @@ func (t *TBSCertificate) Sign(signer Certificate, curve Curve, key []byte) (Cert
 			return ecdsa.SignASN1(rand.Reader, pk, hashed[:])
 		}
 		return t.SignWith(signer, curve, sp)
+	case Curve_MLDSA87:
+		sp := func(certBytes []byte) ([]byte, error) {
+			return pqSign(key, certBytes)
+		}
+		return t.SignWith(signer, curve, sp)
 	default:
-		return nil, fmt.Errorf("invalid curve: %s", t.Curve)
+		return nil, fmt.Errorf("invalid signing curve: %s", curve)
 	}
 }
 
 // SignWith does the same thing as sign, but uses the function in `sp` to calculate the signature.
 // You should only use SignWith if you do not have direct access to your private key.
 func (t *TBSCertificate) SignWith(signer Certificate, curve Curve, sp SignerLambda) (Certificate, error) {
-	if curve != t.Curve {
-		return nil, fmt.Errorf("curve in cert and private key supplied don't match")
+	if curve != signingCurveFor(t.Curve) {
+		return nil, fmt.Errorf("curve in cert (%s) and signing key (%s) don't match", t.Curve, curve)
 	}
 
 	if signer != nil {

@@ -1,0 +1,347 @@
+//go:build e2e_testing
+// +build e2e_testing
+
+package e2e
+
+import (
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/slackhq/nebula/cert"
+	"github.com/slackhq/nebula/cert_test"
+	"github.com/slackhq/nebula/e2e/router"
+	"github.com/slackhq/nebula/header"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
+)
+
+// TestPQGoodHandshake brings up two post-quantum nodes - ML-KEM-1024 node certs
+// signed by an ML-DSA-87 CA - and drives a full 3-message pqIX handshake to a
+// working tunnel, end to end through the real connection manager. This is the
+// node-to-node analog of TestGoodHandshake for the post-quantum curve.
+func TestPQGoodHandshake(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.2/24", nil)
+
+	// Put their address in my lighthouse so I know where to reach them; the
+	// responder learns my address from the incoming handshake.
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a pqIX handshake from me to them")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi from me")))
+
+	// Route every packet - msg1, msg2, msg3, then the cached data packet - until
+	// the data lands on their tun. This drives the full 3-message handshake
+	// through both connection managers.
+	p := r.RouteForAllUntilTxTun(theirControl)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), 80, 80)
+
+	t.Log("pqIX tunnel established; assert bidirectional traffic")
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQRelays is the pqIX analog of TestRelays: me reaches them only through a
+// relay node, so the relay forwards the post-quantum handshake. This stresses the
+// relay-forwarding path with the much larger ML-KEM-1024 flights (msg2 ~6.4 KB),
+// which the relay re-wraps in its own tunnel.
+func TestPQRelays(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
+
+	myControl.InjectLightHouseAddr(relayVpnIpNet[0].Addr(), relayUdpAddr)
+	myControl.InjectRelays(theirVpnIpNet[0].Addr(), []netip.Addr{relayVpnIpNet[0].Addr()})
+	relayControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+
+	r := router.NewR(t, myControl, relayControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	relayControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a pqIX handshake from me to them via the relay")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi from me")))
+
+	p := r.RouteForAllUntilTxTun(theirControl)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), 80, 80)
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+}
+
+// TestPQUntrustedCARejected verifies the runtime rejects a post-quantum peer whose
+// cert is signed by an untrusted CA: the responder must not reply to msg1 or leave
+// any pending state behind (the cert is verified while processing msg1, before any
+// index is allocated).
+func TestPQUntrustedCARejected(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	ca2, _, caKey2, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+
+	// me trusts ca; them is signed by ca2, which me (and them) do not trust each other under.
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca2, caKey2, "them", "10.128.0.2/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet[0].Addr(), myUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Initiate from me; deliver msg1 to the untrusting responder")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi")))
+	msg1 := myControl.GetFromUDP(true)
+	theirControl.InjectUDPPacket(msg1)
+
+	t.Log("The responder must drop it: no msg2, no tunnel, no pending responder")
+	time.Sleep(100 * time.Millisecond)
+	assert.Nil(t, theirControl.GetFromUDP(false), "responder must not reply to an untrusted-CA initiator")
+	assert.Empty(t, theirControl.ListHostmapHosts(false), "no tunnel for an untrusted cert")
+	assert.Empty(t, theirControl.ListHostmapHosts(true), "no pending responder for an untrusted cert")
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQHandshakeTruncatedMsg2Recovery verifies a truncated pqIX msg2 is ignored
+// without killing the initiator's pending handshake, and the real msg2 still
+// completes the tunnel.
+func TestPQHandshakeTruncatedMsg2Recovery(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.2/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet[0].Addr(), myUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger handshake, deliver msg1, get the responder's msg2")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi")))
+	msg1 := myControl.GetFromUDP(true)
+	theirControl.InjectUDPPacket(msg1)
+	msg2 := theirControl.GetFromUDP(true)
+
+	t.Log("Inject a truncated msg2; the initiator must ignore it and keep its pending handshake")
+	trunc := msg2.Copy()
+	trunc.Data = trunc.Data[:header.Len]
+	myControl.InjectUDPPacket(trunc)
+	assert.NotEmpty(t, myControl.ListHostmapHosts(true), "pending handshake must survive a truncated msg2")
+
+	t.Log("Inject the real msg2 and route to completion")
+	myControl.InjectUDPPacket(msg2)
+	cached := r.RouteForAllUntilTxTun(theirControl)
+	assertUdpPacket(t, []byte("Hi"), cached, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), 80, 80)
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQRehandshaking is the pqIX analog of TestRehandshaking: it stands up a
+// post-quantum tunnel, renews one side's ML-KEM-1024 cert (adding a group), and
+// verifies the rehandshake runs the full pqIX exchange again, the peer learns the
+// new cert, and the tunnel collapses to a single one carrying the new identity.
+func TestPQRehandshaking(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, myConfig := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.2/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, theirConfig := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.1/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet[0].Addr(), myUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Stand up a pqIX tunnel")
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	t.Log("Renew my ML-KEM cert with a new group and reload")
+	_, _, myNextPrivKey, myNextPEM := cert_test.NewTestCert(cert.Version2, cert.Curve_MLKEM1024, ca, caKey, "me", time.Now(), time.Now().Add(5*time.Minute), myVpnIpNet, nil, []string{"new group"})
+	caB, err := ca.MarshalPEM()
+	require.NoError(t, err)
+	myConfig.Settings["pki"] = m{
+		"ca":   string(caB),
+		"cert": string(myNextPEM),
+		"key":  string(myNextPrivKey),
+	}
+	rc, err := yaml.Marshal(myConfig.Settings)
+	require.NoError(t, err)
+	myConfig.ReloadConfigString(string(rc))
+
+	t.Log("Spin until they rehandshake and see my new cert")
+	for {
+		assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+		c := theirControl.GetHostInfoByVpnAddr(myVpnIpNet[0].Addr(), false)
+		if c != nil && len(c.Cert.Groups()) != 0 {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	t.Log("Flip their firewall to require the new group, catching a tunnel that reverts")
+	rc, err = yaml.Marshal(theirConfig.Settings)
+	require.NoError(t, err)
+	var theirNewConfig m
+	require.NoError(t, yaml.Unmarshal(rc, &theirNewConfig))
+	theirNewConfig["firewall"].(map[string]any)["inbound"] = []m{{
+		"proto": "any",
+		"port":  "any",
+		"group": "new group",
+	}}
+	rc, err = yaml.Marshal(theirNewConfig)
+	require.NoError(t, err)
+	theirConfig.ReloadConfigString(string(rc))
+
+	t.Log("Spin until a single tunnel remains")
+	for len(myControl.GetHostmap().Indexes)+len(theirControl.GetHostmap().Indexes) > 2 {
+		assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+		time.Sleep(time.Second)
+	}
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	c := theirControl.GetHostInfoByVpnAddr(myVpnIpNet[0].Addr(), false)
+	assert.Contains(t, c.Cert.Groups(), "new group", "the renewed pqIX cert must win")
+	assert.Len(t, myControl.ListHostmapHosts(false), 1)
+	assert.Len(t, theirControl.ListHostmapHosts(false), 1)
+	assert.Len(t, myControl.ListHostmapIndexes(false), 1)
+	assert.Len(t, theirControl.ListHostmapIndexes(false), 1)
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQStage1Race is the pqIX analog of TestStage1Race: two post-quantum nodes
+// handshake each other simultaneously. Each ends up both an initiator and a
+// responder, so two tunnels form; traffic must flow and the connection manager
+// must then collapse down to a single tunnel per side. This exercises the pqIX
+// responder path racing the initiator path on the same node.
+func TestPQStage1Race(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.2/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet[0].Addr(), myUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a pqIX handshake on both sides at once")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi from me")))
+	theirControl.InjectTunPacket(BuildTunUDPPacket(myVpnIpNet[0].Addr(), 80, theirVpnIpNet[0].Addr(), 80, []byte("Hi from them")))
+
+	t.Log("Cross-inject both msg1 packets")
+	myHsForThem := myControl.GetFromUDP(true)
+	theirHsForMe := theirControl.GetFromUDP(true)
+	r.InjectUDPPacket(theirControl, myControl, theirHsForMe)
+	r.InjectUDPPacket(myControl, theirControl, myHsForThem)
+
+	t.Log("Route until each side's cached packet is delivered")
+	myCachedPacket := r.RouteForAllUntilTxTun(theirControl)
+	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), 80, 80)
+	theirCachedPacket := r.RouteForAllUntilTxTun(myControl)
+	assertUdpPacket(t, []byte("Hi from them"), theirCachedPacket, theirVpnIpNet[0].Addr(), myVpnIpNet[0].Addr(), 80, 80)
+
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	t.Log("Two tunnels (initiator + responder) on each side initially")
+	assert.Len(t, myControl.ListHostmapHosts(false), 1)
+	assert.Len(t, theirControl.ListHostmapHosts(false), 1)
+	assert.Len(t, myControl.ListHostmapIndexes(false), 2)
+	assert.Len(t, theirControl.ListHostmapIndexes(false), 2)
+
+	t.Log("Spin until the connection manager collapses to a single tunnel")
+	for len(myControl.GetHostmap().Indexes)+len(theirControl.GetHostmap().Indexes) > 2 {
+		assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+		t.Log("Connection manager hasn't ticked yet")
+		time.Sleep(time.Second)
+	}
+
+	assert.Len(t, myControl.ListHostmapHosts(false), 1)
+	assert.Len(t, theirControl.ListHostmapHosts(false), 1)
+	assert.Len(t, myControl.ListHostmapIndexes(false), 1)
+	assert.Len(t, theirControl.ListHostmapIndexes(false), 1)
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQHandshakeRetransmitDuplicate is the pqIX analog of
+// TestHandshakeRetransmitDuplicate: a retransmitted (identical) msg1 must resend
+// the responder's cached msg2 rather than build a second responder. We assert the
+// responder keeps exactly one pending entry across the duplicate and that the
+// tunnel completes to a single hostinfo on each side.
+func TestPQHandshakeRetransmitDuplicate(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.2/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet[0].Addr(), myUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a pqIX handshake and grab msg1")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi")))
+	msg1 := myControl.GetFromUDP(true)
+
+	t.Log("Deliver msg1; the responder registers one pending handshake and sends msg2")
+	theirControl.InjectUDPPacket(msg1)
+	_ = theirControl.GetFromUDP(true)
+	assert.Len(t, theirControl.ListHostmapIndexes(true), 1, "one pending responder after msg1")
+
+	t.Log("Deliver the SAME msg1 again; dedup must resend the cached msg2, not add a responder")
+	theirControl.InjectUDPPacket(msg1)
+	resp2 := theirControl.GetFromUDP(true)
+	assert.NotNil(t, resp2, "duplicate msg1 should get the cached msg2")
+	assert.Len(t, theirControl.ListHostmapIndexes(true), 1, "still exactly one pending responder after the duplicate")
+
+	t.Log("Complete the handshake (initiator emits msg3 + the cached data packet); route it through")
+	myControl.InjectUDPPacket(resp2)
+	cached := r.RouteForAllUntilTxTun(theirControl)
+	assertUdpPacket(t, []byte("Hi"), cached, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), 80, 80)
+
+	t.Log("Verify exactly one tunnel per side and traffic flows")
+	assert.Len(t, myControl.ListHostmapHosts(false), 1)
+	assert.Len(t, theirControl.ListHostmapHosts(false), 1)
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	myControl.Stop()
+	theirControl.Stop()
+}

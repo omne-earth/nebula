@@ -3,15 +3,31 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime/debug"
 	"strings"
 
 	"github.com/slackhq/nebula"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/control"
 	"github.com/slackhq/nebula/logging"
 	"github.com/slackhq/nebula/util"
 )
+
+// defaultControlSocket is where `nebula ctl` looks for the daemon's control socket unless
+// overridden with `nebula ctl -socket <path>`. Matches the daemon's control.socket default.
+const defaultControlSocket = "/run/nebula.sock"
+
+// runCtlIfRequested handles the `nebula ctl ...` subcommand: if argv is `nebula ctl ...` it
+// runs the control client and returns (true, exitCode); otherwise (false, 0) so main proceeds
+// to run the daemon. Split out (writer-injected) so it is unit-testable without exec.
+func runCtlIfRequested(argv []string, stdout, stderr io.Writer) (handled bool, code int) {
+	if len(argv) >= 2 && argv[1] == "ctl" {
+		return true, control.RunCtl(argv[2:], defaultControlSocket, stdout, stderr)
+	}
+	return false, 0
+}
 
 // A version string that can be set with
 //
@@ -32,6 +48,11 @@ func init() {
 }
 
 func main() {
+	// `nebula ctl ...` is a client subcommand, not the daemon - handle it before flag parsing.
+	if handled, code := runCtlIfRequested(os.Args, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+
 	configPath := flag.String("config", "", "Path to either a file or directory to load configuration from")
 	configTest := flag.Bool("test", false, "Test the config and print the end result. Non zero exit indicates a faulty config")
 	printVersion := flag.Bool("version", false, "Print version")

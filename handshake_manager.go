@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"log/slog"
 	"net/netip"
 	"slices"
@@ -65,6 +66,17 @@ type HandshakeManager struct {
 	outside                udp.Conn
 	config                 HandshakeConfig
 	OutboundHandshakeTimer *LockingTimerWheel[netip.Addr]
+	// pendingResponderTimer bounds the lifetime of pqIX responder handshakes.
+	// Unlike an initiator (keyed in vpnIps and driven by OutboundHandshakeTimer),
+	// a multi-message responder is only in the indexes map, so nothing else would
+	// ever reap it if the final message never arrives. Keyed by localIndex.
+	pendingResponderTimer *LockingTimerWheel[uint32]
+	// pendingResponderByMsg1 deduplicates retransmitted pqIX msg1 packets: a
+	// duplicate (the initiator resending the identical msg1) resends the cached
+	// msg2 instead of building a second responder, mirroring IX's ErrAlreadySeen
+	// cached-response path. Keyed by a hash of the msg1 body; guarded by the
+	// manager lock.
+	pendingResponderByMsg1 map[uint64]*HandshakeHostInfo
 	messageMetrics         *MessageMetrics
 	metricInitiated        metrics.Counter
 	metricTimedOut         metrics.Counter
@@ -88,6 +100,11 @@ type HandshakeHostInfo struct {
 
 	hostinfo *HostInfo
 	machine  *handshake.Machine // The handshake state machine, set during stage 0 (initiator) or beginHandshake (responder multi-message)
+
+	// pendingResponder marks a multi-message (pqIX) responder that is waiting for
+	// its final message. Such an entry lives only in the indexes map and is reaped
+	// by pendingResponderTimer if the handshake never completes.
+	pendingResponder bool
 }
 
 func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback, m *cachedPacketMetrics) {
@@ -125,6 +142,8 @@ func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *Light
 		config:                 config,
 		trigger:                make(chan netip.Addr, config.triggerBuffer),
 		OutboundHandshakeTimer: NewLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
+		pendingResponderTimer:  NewLockingTimerWheel[uint32](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
+		pendingResponderByMsg1: map[uint64]*HandshakeHostInfo{},
 		messageMetrics:         config.messageMetrics,
 		metricInitiated:        metrics.GetOrRegisterCounter("handshake_manager.initiated", nil),
 		metricTimedOut:         metrics.GetOrRegisterCounter("handshake_manager.timed_out", nil),
@@ -144,6 +163,7 @@ func (hm *HandshakeManager) Run(ctx context.Context) {
 			hm.handleOutbound(vpnIP, true)
 		case now := <-clockSource.C:
 			hm.NextOutboundHandshakeTimerTick(now)
+			hm.reapPendingResponders(now)
 		}
 	}
 }
@@ -153,7 +173,7 @@ func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *head
 	// don't yet support) are dropped here rather than silently routed through
 	// the IX path. Add a case when introducing a new pattern.
 	switch h.Subtype {
-	case header.HandshakeIXPSK0:
+	case header.HandshakeIXPSK0, header.HandshakePQIX:
 		// supported
 	default:
 		hm.l.Debug("dropping handshake with unsupported subtype",
@@ -190,6 +210,43 @@ func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *head
 	if hh := hm.queryIndex(h.RemoteIndex); hh != nil {
 		hm.continueHandshake(via, hh, packet)
 		return
+	}
+}
+
+// reapPendingResponders deletes pqIX responder handshakes whose final message
+// never arrived. A responder registers a pending index when it replies to msg1
+// (beginHandshake) but, unlike an initiator, it is not in vpnIps and so is never
+// visited by handleOutbound - nothing else would ever clean it up. This bounds
+// that state to the same budget an initiator gets.
+func (hm *HandshakeManager) reapPendingResponders(now time.Time) {
+	hm.pendingResponderTimer.Advance(now)
+	for {
+		index, has := hm.pendingResponderTimer.Purge()
+		if !has {
+			break
+		}
+
+		// Take hh.Lock before the manager lock (the order used everywhere else)
+		// and re-verify under both: a responder that completed has had its
+		// ConnectionState set and been moved out of the indexes map, so its timer
+		// firing here is a no-op. Holding hh.Lock also blocks an in-flight
+		// completion from racing the delete.
+		hh := hm.queryIndex(index)
+		if hh == nil {
+			continue
+		}
+		hh.Lock()
+		hm.Lock()
+		if cur, ok := hm.indexes[index]; ok && cur == hh && hh.pendingResponder && hh.hostinfo.ConnectionState == nil {
+			hm.unlockedDeleteHostInfo(hh.hostinfo)
+			hm.forgetPendingResponderMsg1(hh.hostinfo)
+			hm.metricTimedOut.Inc(1)
+			if hm.l.Enabled(context.Background(), slog.LevelDebug) {
+				hm.l.Debug("Pending pqIX responder handshake timed out", "localIndex", index)
+			}
+		}
+		hm.Unlock()
+		hh.Unlock()
 	}
 }
 
@@ -246,13 +303,14 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 		}
 	}
 
-	// TODO: this hardcodes "always retransmit stage 0", which is correct for
-	// IX (the initiator only ever sends one packet, msg1) but wrong the
-	// moment a 3+ message pattern lands. The retry loop should resend the
-	// most recent outgoing message, not always stage 0. That implies
-	// HandshakeHostInfo tracking a single "currentOutbound" packet (bytes +
-	// header metadata) that gets replaced as the handshake progresses,
-	// instead of indexing into HandshakePacket.
+	// The initiator only ever retransmits stage 0 (msg1). This holds for both IX
+	// (one initiator message) and pqIX: a pqIX initiator completes synchronously
+	// when it processes msg2 - continueHandshake writes msg3 and moves the
+	// hostinfo to the main map in the same call - so while it is still pending
+	// here its only outgoing message is msg1. The responder's msg2 is resent in
+	// response to this retransmitted msg1 via the dedup path in beginHandshake. A
+	// future pattern where the initiator stays pending after a later message would
+	// instead need a tracked "most recent outgoing" packet.
 	stage0 := hostinfo.HandshakePacket[handshakePacketStage0]
 	hsFields := m{
 		"stage": uint64(hh.machine.MessageIndex()),
@@ -641,6 +699,38 @@ func hsTimeout(tries int64, interval time.Duration) time.Duration {
 	return time.Duration(tries / 2 * ((2 * int64(interval)) + (tries-1)*int64(interval)))
 }
 
+// handshakeSubtypeForCurve picks the handshake subtype implied by a credential's
+// curve: an ML-KEM-1024 node key uses the 3-message post-quantum pqIX-analog,
+// every classical curve uses the 2-message Noise IX. Selection is by curve, the
+// same way upstream already picks Curve25519 vs P256 for the noise DH.
+func handshakeSubtypeForCurve(c cert.Curve) header.MessageSubType {
+	if c == cert.Curve_MLKEM1024 {
+		return header.HandshakePQIX
+	}
+	return header.HandshakeIXPSK0
+}
+
+// pqMsg1Key hashes a pqIX msg1 body so retransmitted (identical) msg1 packets map
+// to the same pending responder. A collision only risks resending a cached msg2 to
+// the wrong peer, which that peer drops on subtype/index mismatch; the dedup path
+// also confirms an exact byte match before trusting a hit.
+func pqMsg1Key(msg1 []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(msg1)
+	return h.Sum64()
+}
+
+// forgetPendingResponderMsg1 drops a pending responder's msg1 dedup entry once it
+// leaves the pending map (completed or reaped). Caller holds the manager lock.
+func (hm *HandshakeManager) forgetPendingResponderMsg1(hi *HostInfo) {
+	if hi == nil {
+		return
+	}
+	if msg1 := hi.HandshakePacket[handshakePacketStage0]; msg1 != nil {
+		delete(hm.pendingResponderByMsg1, pqMsg1Key(msg1))
+	}
+}
+
 // buildStage0Packet creates the initial handshake packet for the initiator.
 func (hm *HandshakeManager) buildStage0Packet(hh *HandshakeHostInfo) bool {
 	cs := hm.f.pki.getCertState()
@@ -666,7 +756,7 @@ func (hm *HandshakeManager) buildStage0Packet(hh *HandshakeHostInfo) bool {
 	machine, err := handshake.NewMachine(
 		v, cs.GetCredential,
 		hm.certVerifier(), func() (uint32, error) { return hm.allocateIndex(hh) },
-		true, header.HandshakeIXPSK0,
+		true, handshakeSubtypeForCurve(cred.Cert.Curve()),
 	)
 	if err != nil {
 		hm.f.l.Error("Failed to create handshake machine",
@@ -698,37 +788,123 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 	cs := f.pki.getCertState()
 
 	v := cs.DefaultVersion()
-	if cs.GetCredential(v) == nil {
+	cred := cs.GetCredential(v)
+	if cred == nil {
 		f.l.Error("Unable to handshake with host because no certificate is available",
 			"from", via, "certVersion", v)
 		return
 	}
 
+	// A 3-message responder (pqIX) does not complete on the first packet: it
+	// must persist as a pending handshake so the final message routes back here
+	// via continueHandshake. Pre-create the pending HandshakeHostInfo and let
+	// the Machine register its index through allocateIndex (called when it
+	// builds msg2). The classical IX responder completes synchronously and never
+	// enters the pending map - it keeps using an unregistered generateIndex.
+	subtype := handshakeSubtypeForCurve(cred.Cert.Curve())
+	multiMessage := subtype == header.HandshakePQIX
+
+	var msg1Key uint64
+	if multiMessage {
+		// Dedup a retransmitted msg1: if we already have a pending responder for
+		// this exact msg1, resend its cached msg2 rather than running ML-KEM again
+		// and registering a second responder (the IX ErrAlreadySeen analog).
+		msg1Key = pqMsg1Key(packet[header.Len:])
+		hm.RLock()
+		existing := hm.pendingResponderByMsg1[msg1Key]
+		hm.RUnlock()
+		if existing != nil {
+			existing.Lock()
+			dup := bytes.Equal(existing.hostinfo.HandshakePacket[handshakePacketStage0], packet[header.Len:])
+			cachedMsg2 := existing.hostinfo.HandshakePacket[handshakePacketStage2]
+			hi := existing.hostinfo
+			existing.Unlock()
+			if dup {
+				hm.sendHandshakeResponse(via, cachedMsg2, hi, true)
+				return
+			}
+		}
+	}
+
+	allocIndex := func() (uint32, error) { return generateIndex(f.l) }
+	var hh *HandshakeHostInfo
+	if multiMessage {
+		hh = &HandshakeHostInfo{
+			hostinfo: &HostInfo{
+				HandshakePacket: make(map[uint8][]byte, 0),
+				relayState: RelayState{
+					relays:         nil,
+					relayForByAddr: map[netip.Addr]*Relay{},
+					relayForByIdx:  map[uint32]*Relay{},
+				},
+			},
+			startTime:        time.Now(),
+			pendingResponder: true,
+		}
+		// Hold hh.Lock across ProcessPacket and the reply: once allocateIndex
+		// registers the index, a racing msg3 could reach continueHandshake,
+		// which also takes hh.Lock before touching the (not concurrency-safe)
+		// Machine.
+		hh.Lock()
+		defer hh.Unlock()
+		allocIndex = func() (uint32, error) { return hm.allocateIndex(hh) }
+	}
+
 	machine, err := handshake.NewMachine(
 		v, cs.GetCredential,
-		hm.certVerifier(), func() (uint32, error) { return generateIndex(f.l) },
-		false, header.HandshakeIXPSK0,
+		hm.certVerifier(), allocIndex,
+		false, subtype,
 	)
 	if err != nil {
 		f.l.Error("Failed to create handshake machine", "from", via, "error", err)
 		return
 	}
+	if multiMessage {
+		hh.machine = machine
+	}
 
 	response, result, err := machine.ProcessPacket(nil, packet)
 	if err != nil {
 		f.l.Error("Failed to process handshake packet", "from", via, "error", err)
+		if multiMessage {
+			// allocateIndex may have registered the index before the failure.
+			hm.DeleteHostInfo(hh.hostinfo)
+		}
 		return
 	}
 
 	if result == nil {
-		// Multi-message pattern: the responder Machine would need to be
-		// registered in hm.indexes so a future inbound packet finds it via
-		// continueHandshake. The current manager doesn't do that yet, so
-		// fail loudly rather than silently dropping the in-flight handshake.
-		// TODO: support multi-message responder flows (XX, pqIX, etc.).
-		// See also the IX-shaped cipher key assignment in handshake.Machine.
-		f.l.Error("multi-message handshake responder is not supported",
-			"from", via, "error", handshake.ErrMultiMessageUnsupported)
+		if !multiMessage {
+			// IX always completes on the first packet; a nil result here would
+			// be a protocol invariant violation, not a supported flow.
+			f.l.Error("multi-message handshake responder is not supported",
+				"from", via, "error", handshake.ErrMultiMessageUnsupported)
+			return
+		}
+		// pqIX: msg1 processed, msg2 produced. Persist the pending responder
+		// and reply; completion happens when msg3 arrives via continueHandshake.
+		hostinfo := hh.hostinfo
+		// packet aliases the listener's incoming buffer, so this copy must stay.
+		hostinfo.HandshakePacket[handshakePacketStage0] = make([]byte, len(packet[header.Len:]))
+		copy(hostinfo.HandshakePacket[handshakePacketStage0], packet[header.Len:])
+		if response != nil {
+			hostinfo.HandshakePacket[handshakePacketStage2] = response
+		}
+		// Bound this pending responder's lifetime: if msg3 never arrives, the
+		// reaper (pendingResponderTimer) deletes the index after the same budget
+		// an initiator handshake gets, so the entry can't leak.
+		hm.pendingResponderTimer.Add(hostinfo.localIndexId, hsTimeout(hm.config.retries, hm.config.tryInterval))
+
+		// Register for msg1 dedup so a retransmitted msg1 resends this cached msg2
+		// instead of building another responder.
+		hm.Lock()
+		hm.pendingResponderByMsg1[msg1Key] = hh
+		hm.Unlock()
+
+		// The reply goes straight to via.UdpAddr; hostinfo.remote (and vpnAddrs,
+		// remotes) aren't known until the cert is validated at msg3 completion,
+		// so don't SetRemote here - it would index an empty vpnAddrs.
+		hm.sendHandshakeResponse(via, response, hostinfo, false)
 		return
 	}
 
@@ -805,6 +981,71 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 	}
 }
 
+// completeResponderHandshake finishes a pending pqIX responder when its final
+// message (msg3) arrives. The hostinfo is already registered in the pending map
+// (beginHandshake); this validates the peer, fills in identity + transport
+// state, and promotes it to the main host map. The caller holds hh.Lock.
+func (hm *HandshakeManager) completeResponderHandshake(via ViaSender, hh *HandshakeHostInfo, result *handshake.Result) {
+	f := hm.f
+	hostinfo := hh.hostinfo
+
+	remoteCert := result.RemoteCert
+	if remoteCert == nil {
+		f.l.Error("Handshake completed without peer certificate", "from", via)
+		hm.DeleteHostInfo(hostinfo)
+		return
+	}
+
+	vpnAddrs, anyVpnAddrsInCommon, ok := hm.validatePeerCert(via, remoteCert)
+	if !ok {
+		hm.DeleteHostInfo(hostinfo)
+		return
+	}
+
+	hostinfo.ConnectionState = newConnectionStateFromResult(result)
+	hostinfo.localIndexId = result.LocalIndex
+	hostinfo.remoteIndexId = result.RemoteIndex
+	hostinfo.vpnAddrs = vpnAddrs
+	hostinfo.lastHandshakeTime = result.HandshakeTime
+	hostinfo.remotes = f.lightHouse.QueryCache(vpnAddrs)
+	if !via.IsRelayed {
+		hostinfo.SetRemote(via.UdpAddr)
+	} else {
+		hostinfo.relayState.InsertRelayTo(via.relayHI.vpnAddrs[0])
+	}
+	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
+
+	msg := "Handshake message received"
+	if !anyVpnAddrsInCommon {
+		msg = "Handshake message received, but no vpnNetworks in common."
+	}
+	f.l.Info(msg,
+		"vpnAddrs", vpnAddrs,
+		"from", via,
+		"certName", remoteCert.Certificate.Name(),
+		"certVersion", remoteCert.Certificate.Version(),
+		"fingerprint", remoteCert.Fingerprint,
+		"issuer", remoteCert.Certificate.Issuer(),
+		"initiatorIndex", result.RemoteIndex,
+		"responderIndex", result.LocalIndex,
+		"handshake", m{"stage": uint64(hh.machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, hh.machine.Subtype())},
+	)
+
+	// The responder is already in the pending map; Complete moves it to the main
+	// host map (removing the pending index).
+	hm.Complete(hostinfo, f)
+	hm.Lock()
+	hm.forgetPendingResponderMsg1(hostinfo)
+	hm.Unlock()
+	f.connectionManager.AddTrafficWatch(hostinfo)
+	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
+
+	// Don't wait for UpdateWorker
+	if f.lightHouse.IsAnyLighthouseAddr(vpnAddrs) {
+		f.lightHouse.TriggerUpdate()
+	}
+}
+
 // continueHandshake feeds an incoming packet to an existing pending handshake Machine.
 func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostInfo, packet []byte) {
 	f := hm.f
@@ -860,6 +1101,14 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 	}
 
 	if result == nil {
+		return
+	}
+
+	// A responder completing its final message (pqIX msg3) takes a distinct
+	// path: it has no "intended" peer to re-verify, and it promotes a hostinfo
+	// that is already pending. The initiator completion tail below is unchanged.
+	if !result.Initiator {
+		hm.completeResponderHandshake(via, hh, result)
 		return
 	}
 
@@ -1052,12 +1301,15 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 	// block if so.
 	logFields := []any{
 		"vpnAddrs", hostinfo.vpnAddrs,
-		"handshake", m{"stage": uint64(2), "style": header.SubTypeName(header.Handshake, header.HandshakeIXPSK0)},
+		"handshake", m{"stage": uint64(2), "style": header.SubTypeName(header.Handshake, header.MessageSubType(msg[1]))},
 		"cached", cached,
 		"initiatorIndex", hostinfo.remoteIndexId,
 		"responderIndex", hostinfo.localIndexId,
 	}
-	if peerCert := hostinfo.ConnectionState.peerCert; peerCert != nil {
+	// ConnectionState is nil for an in-flight multi-message responder (pqIX
+	// msg2): the handshake hasn't completed, so there's no peer cert to log yet.
+	if cs := hostinfo.ConnectionState; cs != nil && cs.peerCert != nil {
+		peerCert := cs.peerCert
 		logFields = append(logFields,
 			"certName", peerCert.Certificate.Name(),
 			"certVersion", peerCert.Certificate.Version(),

@@ -217,7 +217,10 @@ func (ncp *CAPool) verify(c Certificate, now time.Time, certFp string, signerFp 
 		return nil, err
 	}
 
-	if signer.Certificate.Curve() != c.Curve() {
+	// The signer's curve must be the one that signs the cert's curve. For the
+	// classical curves this is just equality; for post-quantum it allows an
+	// ML-DSA-87 CA to sign an ML-KEM-1024 node cert (the node KEM key cannot sign).
+	if signer.Certificate.Curve() != signingCurveFor(c.Curve()) {
 		return nil, ErrCurveMismatch
 	}
 

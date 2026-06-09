@@ -1,3 +1,5 @@
+//go:build sshd
+
 package sshd
 
 import (
@@ -8,7 +10,7 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/armon/go-radix"
+	"github.com/slackhq/nebula/control"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -22,24 +24,26 @@ type SSHServer struct {
 	trustedKeys map[string]map[string]bool
 	trustedCAs  []ssh.PublicKey
 
-	// List of available commands
-	helpCommand *Command
-	commands    *radix.Tree
-	listener    net.Listener
+	// The transport-neutral command set this server exposes. Owned by the daemon and shared
+	// with any other front end (the control socket); the embedded sshd is just one transport
+	// over it. Per-session copies (with a `logout` command) are derived in NewSession.
+	reg *control.Registry
+
+	listener net.Listener
 
 	// ctx parents per-Run contexts. Cancelling it (e.g. via Control.Stop) tears the server down even
 	// across reloads, since each Run derives a fresh child rather than reusing this one directly.
 	ctx context.Context
 }
 
-// NewSSHServer creates a new ssh server rigged with default commands and prepares to listen.
-// The ssh server's context is parented off the supplied ctx so cancelling it
+// NewSSHServer creates a new ssh server that exposes the supplied control registry and prepares
+// to listen. The ssh server's context is parented off the supplied ctx so cancelling it
 // (e.g. on Control.Stop) tears down active sessions and closes the listener.
-func NewSSHServer(ctx context.Context, l *slog.Logger) (*SSHServer, error) {
+func NewSSHServer(ctx context.Context, l *slog.Logger, reg *control.Registry) (*SSHServer, error) {
 	s := &SSHServer{
 		trustedKeys: make(map[string]map[string]bool),
 		l:           l,
-		commands:    radix.New(),
+		reg:         reg,
 		ctx:         ctx,
 	}
 
@@ -82,14 +86,6 @@ func NewSSHServer(ctx context.Context, l *slog.Logger) (*SSHServer, error) {
 		PublicKeyCallback: cc.Authenticate,
 		ServerVersion:     fmt.Sprintf("SSH-2.0-Nebula???"),
 	}
-
-	s.RegisterCommand(&Command{
-		Name:             "help",
-		ShortDescription: "prints available commands or help <command> for specific usage info",
-		Callback: func(a any, args []string, w StringWriter) error {
-			return helpCallback(s.commands, args, w)
-		},
-	})
 
 	return s, nil
 }
@@ -143,11 +139,6 @@ func (s *SSHServer) AddAuthorizedKey(user, pubKey string) error {
 		"sshUser", user,
 	)
 	return nil
-}
-
-// RegisterCommand adds a command that can be run by a user, by default only `help` is available
-func (s *SSHServer) RegisterCommand(c *Command) {
-	s.commands.Insert(c.Name, c)
 }
 
 // Run begins listening and accepting connections. Each invocation derives a fresh per-Run context
@@ -240,7 +231,7 @@ func (s *SSHServer) run(ctx context.Context, listener net.Listener) {
 				"sshFingerprint", fp,
 			)
 
-			NewSession(s.commands, conn, chans, sessionCancel, l.With("subsystem", "sshd.session"))
+			NewSession(s.reg, conn, chans, sessionCancel, l.With("subsystem", "sshd.session"))
 
 			go ssh.DiscardRequests(reqs)
 

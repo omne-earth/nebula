@@ -1,6 +1,7 @@
 package noiseutil
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -19,6 +20,23 @@ type CipherStateAESGCM struct {
 // otherwise the type assertion still succeeds but the nonce endianness will be wrong on the wire.
 func NewCipherStateAESGCM(s *noise.CipherState) *CipherStateAESGCM {
 	return &CipherStateAESGCM{c: s.Cipher().(cipher.AEAD)}
+}
+
+// NewCipherStateAESGCMFromKey builds an AES-256-GCM data-plane CipherState from a raw
+// 32-byte key. The post-quantum handshake (qp-nebula) derives raw transport keys from
+// its KEM Split rather than a noise.CipherState, so it builds the data-plane cipher
+// directly. The nonce endianness (big-endian, below) is identical to the noise path, so
+// both peers and both handshake kinds agree on the wire.
+func NewCipherStateAESGCMFromKey(key []byte) (*CipherStateAESGCM, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &CipherStateAESGCM{c: aead}, nil
 }
 
 func (s *CipherStateAESGCM) EncryptDanger(out, ad, plaintext []byte, n uint64, nb []byte) ([]byte, error) {
