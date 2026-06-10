@@ -12,6 +12,7 @@ import (
 	"github.com/slackhq/nebula/cert_test"
 	"github.com/slackhq/nebula/e2e/router"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
@@ -341,6 +342,82 @@ func TestPQHandshakeRetransmitDuplicate(t *testing.T) {
 	assert.Len(t, myControl.ListHostmapHosts(false), 1)
 	assert.Len(t, theirControl.ListHostmapHosts(false), 1)
 	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+// TestPQDataBeforeMsg3 reproduces the tunnel-destruction race seen on real
+// fleets: the pqIX initiator completes on SENDING msg3 and immediately flushes
+// its cached data packet, but msg3 is a multi-fragment ~8KB datagram while the
+// data is one small packet, so on a real network the data can arrive FIRST.
+// The responder is still mid-handshake for that index; it must drop the early
+// packet, NOT send a recv_error - a recv_error makes the initiator close the
+// healthy tunnel it just completed, the responder's probes then draw the mirror
+// recv_error, and every subsequent handshake dies the same way (the mesh never
+// converges). Asserts the handshake survives the reorder and the SAME tunnel
+// (one index per side, no re-handshake) carries traffic.
+func TestPQDataBeforeMsg3(t *testing.T) {
+	t.Parallel()
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_MLDSA87, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServerWithCurve(cert.Curve_MLKEM1024, cert.Version2, ca, caKey, "them", "10.128.0.2/24", nil)
+
+	myControl.InjectLightHouseAddr(theirVpnIpNet[0].Addr(), theirUdpAddr)
+
+	r := router.NewR(t, myControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a pqIX handshake from me to them")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIpNet[0].Addr(), 80, myVpnIpNet[0].Addr(), 80, []byte("Hi from me")))
+
+	t.Log("Walk msg1 and msg2 by hand")
+	msg1 := myControl.GetFromUDP(true)
+	r.InjectUDPPacket(myControl, theirControl, msg1)
+	msg2 := theirControl.GetFromUDP(true)
+	r.InjectUDPPacket(theirControl, myControl, msg2)
+
+	t.Log("I complete on sending msg3 and flush the cached data right behind it")
+	// Classify by header instead of by position: the initiator retransmits msg1
+	// on its tryInterval until msg2 is processed, so blind pops can grab a
+	// retransmit and mislabel the packets.
+	var msg3, data *udp.Packet
+	for msg3 == nil || data == nil {
+		p := myControl.GetFromUDP(true)
+		h := &header.H{}
+		require.NoError(t, h.Parse(p.Data))
+		switch {
+		case h.Type == header.Handshake && h.MessageCounter == 3:
+			msg3 = p
+		case h.Type == header.Message:
+			data = p
+		default:
+			// msg1 retransmit - irrelevant to the race
+		}
+	}
+
+	t.Log("Deliver the small data packet FIRST - on the wire it beats the fragmented msg3")
+	r.InjectUDPPacket(myControl, theirControl, data)
+	r.InjectUDPPacket(myControl, theirControl, msg3)
+
+	// The early data is DROPPED (not queued), so wait for the responder to finish
+	// processing msg3 before asserting traffic - assertTunnel sends a single ping
+	// and a ping that races the completion would be dropped the same way.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(theirControl.ListHostmapIndexes(false)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.Len(t, theirControl.ListHostmapIndexes(false), 1, "responder must complete after msg3")
+
+	t.Log("The early data is dropped, the handshake still completes, the tunnel carries traffic")
+	assertTunnel(t, myVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr(), myControl, theirControl, r)
+
+	t.Log("Exactly one tunnel per side - no recv_error teardown, no re-handshake")
+	assert.Len(t, myControl.ListHostmapIndexes(false), 1)
+	assert.Len(t, theirControl.ListHostmapIndexes(false), 1)
 
 	myControl.Stop()
 	theirControl.Stop()

@@ -97,6 +97,20 @@ func (f *Interface) readOutsidePackets(via ViaSender, out []byte, packet []byte,
 	// recvError if necessary
 	if hostinfo == nil || hostinfo.ConnectionState == nil {
 		if !via.IsRelayed {
+			// pqIX: the initiator completes on SENDING msg3 and immediately flushes
+			// cached data, which can overtake the large multi-fragment msg3 in
+			// flight. An index that is still mid-handshake is not an unknown
+			// tunnel - drop the early packet and let the peer retransmit; a
+			// recv_error here makes the initiator tear down the healthy tunnel it
+			// just completed, and the two sides then destroy every subsequent
+			// handshake the same way.
+			if f.handshakeManager.queryIndex(h.RemoteIndex) != nil {
+				if f.l.Enabled(context.Background(), slog.LevelDebug) {
+					f.l.Debug("Dropping early packet for mid-handshake index",
+						"index", h.RemoteIndex, "from", via)
+				}
+				return
+			}
 			f.maybeSendRecvError(via.UdpAddr, h.RemoteIndex)
 		}
 		return
