@@ -83,9 +83,14 @@ type TesterConn struct {
 
 func NewListener(l *slog.Logger, ip netip.Addr, port int, _ bool, _ int) (Conn, error) {
 	return &TesterConn{
-		Addr:      netip.AddrPortFrom(ip, uint16(port)),
-		RxPackets: make(chan *Packet, 10),
-		TxPackets: make(chan *Packet, 10),
+		Addr: netip.AddrPortFrom(ip, uint16(port)),
+		// Buffered deep enough to absorb a full chunked+redundant handshake flight
+		// emitted in one tight WriteTo loop (handshake chunking sends up to
+		// maxChunksPerFlight*HandshakeChunkRedundancy datagrams back-to-back). A
+		// real UDP socket's kernel buffer absorbs such a burst; too small a channel
+		// here would instead block the sender goroutine and deadlock the test.
+		RxPackets: make(chan *Packet, 256),
+		TxPackets: make(chan *Packet, 256),
 		done:      make(chan struct{}),
 		l:         l,
 	}, nil

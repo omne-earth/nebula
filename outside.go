@@ -78,6 +78,20 @@ func (f *Interface) readOutsidePackets(via ViaSender, out []byte, packet []byte,
 		f.handshakeManager.HandleIncoming(via, packet, h)
 		return
 
+	case header.HandshakeChunk:
+		// One fragment of an oversized handshake flight. Buffer it; when the
+		// flight is complete, dispatch the reassembled datagram through the
+		// normal handshake path exactly as if it had arrived whole.
+		if reassembled, ok := f.handshakeManager.handleChunk(via, packet, h); ok {
+			rh := &header.H{}
+			if err := rh.Parse(reassembled); err == nil {
+				f.handshakeManager.HandleIncoming(via, reassembled, rh)
+			} else if f.l.Enabled(context.Background(), slog.LevelDebug) {
+				f.l.Debug("Reassembled handshake failed to parse", "from", via, "error", err)
+			}
+		}
+		return
+
 	case header.RecvError:
 		f.handleRecvError(via.UdpAddr, h)
 		return

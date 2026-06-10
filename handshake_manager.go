@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -85,6 +86,12 @@ type HandshakeManager struct {
 
 	// can be used to trigger outbound handshake for the given vpnIp
 	trigger chan netip.Addr
+
+	// Handshake chunking: oversized flights (pqIX ML-KEM) are split on emit so
+	// they cross fragment-hostile paths, and reassembled on ingest. flightCounter
+	// labels each split flight; chunkRx buffers inbound partial flights.
+	flightCounter atomic.Uint32
+	chunkRx       *chunkReassembler
 }
 
 type HandshakeHostInfo struct {
@@ -133,7 +140,7 @@ func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, s
 }
 
 func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *LightHouse, outside udp.Conn, config HandshakeConfig) *HandshakeManager {
-	return &HandshakeManager{
+	hm := &HandshakeManager{
 		vpnIps:                 map[netip.Addr]*HandshakeHostInfo{},
 		indexes:                map[uint32]*HandshakeHostInfo{},
 		mainHostMap:            mainHostMap,
@@ -147,8 +154,72 @@ func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *Light
 		messageMetrics:         config.messageMetrics,
 		metricInitiated:        metrics.GetOrRegisterCounter("handshake_manager.initiated", nil),
 		metricTimedOut:         metrics.GetOrRegisterCounter("handshake_manager.timed_out", nil),
+		chunkRx:                newChunkReassembler(l),
 		l:                      l,
 	}
+	// Seed the chunk flightID counter from a random base so two freshly-started
+	// nodes don't both number their flights from 0 — which would collide in a
+	// relay's reassembler (keyed by relayAddr+flightID). Not security-grade, just
+	// collision avoidance; a clash only costs a dropped flight that the retry rebuilds.
+	var seed [4]byte
+	if _, err := rand.Read(seed[:]); err == nil {
+		hm.flightCounter.Store(binary.BigEndian.Uint32(seed[:]))
+	}
+	return hm
+}
+
+// chunkThisHandshake reports whether a handshake datagram should be chunked.
+// Only the post-quantum pqIX flights are large enough to IP-fragment (ML-KEM
+// msg1 ~7.9KB, msg2 ~6.4KB); we always chunk those so the kernel never sees a
+// fragmentable datagram. Classical IX flights are small (~200B), never fragment,
+// and stay on the upstream-compatible whole-datagram path.
+func chunkThisHandshake(msg []byte) bool {
+	return len(msg) >= header.Len && header.MessageSubType(msg[1]) == header.HandshakePQIX
+}
+
+// writeHandshake sends a handshake datagram to addr over the direct underlay.
+// A pqIX flight is ALWAYS chunked (even sub-ceiling) and each chunk sent
+// HandshakeChunkRedundancy times, so the kernel never sees a fragmentable
+// datagram; the receiver reassembles via chunkRx. Classical IX goes whole.
+func (hm *HandshakeManager) writeHandshake(msg []byte, addr netip.AddrPort) error {
+	if !chunkThisHandshake(msg) {
+		return hm.outside.WriteTo(msg, addr)
+	}
+	return emitHandshakeChunks(hm.flightCounter.Add(1), msg, func(c []byte) error {
+		return hm.outside.WriteTo(c, addr)
+	})
+}
+
+// writeHandshakeVia sends a handshake datagram to a peer through a relay, with
+// the same chunk-pqIX invariant as the direct path: the inner pqIX flight is
+// chunked and each chunk relay-forwarded, so neither the inner nor the
+// relay-wrapped datagram is large enough to IP-fragment. Classical IX goes whole.
+func (hm *HandshakeManager) writeHandshakeVia(relayHI *HostInfo, relay *Relay, msg []byte) error {
+	if !chunkThisHandshake(msg) {
+		hm.f.SendVia(relayHI, relay, msg, make([]byte, 12), make([]byte, mtu), false)
+		return nil
+	}
+	return emitHandshakeChunks(hm.flightCounter.Add(1), msg, func(c []byte) error {
+		hm.f.SendVia(relayHI, relay, c, make([]byte, 12), make([]byte, mtu), false)
+		return nil
+	})
+}
+
+// handleChunk feeds one inbound HandshakeChunk to the reassembler. When the
+// final chunk of a flight arrives it returns the reconstructed handshake
+// datagram and true; the caller dispatches it through the normal handshake path.
+func (hm *HandshakeManager) handleChunk(via ViaSender, packet []byte, h *header.H) ([]byte, bool) {
+	if len(packet) <= header.Len {
+		return nil, false
+	}
+	// Key by the sending underlay address. For a relayed chunk that is the relay's
+	// address, so flights from distinct initiators sharing one relay are told apart
+	// only by flightID — which is seeded from a random base per process, making a
+	// (relayAddr,flightID) collision between two live initiators negligible (and a
+	// collision merely drops a flight, which the retry rebuilds). entropia-grade
+	// flight IDs close the residual fully on asgard.
+	idx, count := unpackChunkMeta(h.MessageCounter)
+	return hm.chunkRx.offer(via.UdpAddr, h.RemoteIndex, idx, count, packet[header.Len:])
 }
 
 func (hm *HandshakeManager) Run(ctx context.Context) {
@@ -351,7 +422,7 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	var sentTo []netip.AddrPort
 	hostinfo.remotes.ForEach(hm.mainHostMap.GetPreferredRanges(), func(addr netip.AddrPort, _ bool) {
 		hm.messageMetrics.Tx(header.Handshake, hh.machine.Subtype(), 1)
-		err := hm.outside.WriteTo(stage0, addr)
+		err := hm.writeHandshake(stage0, addr)
 		if err != nil {
 			hostinfo.logger(hm.l).Error("Failed to send handshake message",
 				"udpAddr", addr,
@@ -1301,7 +1372,10 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 	// block if so.
 	logFields := []any{
 		"vpnAddrs", hostinfo.vpnAddrs,
-		"handshake", m{"stage": uint64(2), "style": header.SubTypeName(header.Handshake, header.MessageSubType(msg[1]))},
+		// Report the real stage from the outgoing datagram's MessageCounter, not a
+		// hardcoded 2: this path also carries the initiator's pqIX msg3 (sent from
+		// continueHandshake), which a fixed "stage:2" would mislabel.
+		"handshake", m{"stage": binary.BigEndian.Uint64(msg[8:16]), "style": header.SubTypeName(header.Handshake, header.MessageSubType(msg[1]))},
 		"cached", cached,
 		"initiatorIndex", hostinfo.remoteIndexId,
 		"responderIndex", hostinfo.localIndexId,
@@ -1320,7 +1394,7 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 
 	if !via.IsRelayed {
 		fields := append(logFields, "from", via)
-		err := f.outside.WriteTo(msg, via.UdpAddr)
+		err := hm.writeHandshake(msg, via.UdpAddr)
 		if err != nil {
 			f.l.Error("Failed to send handshake message", append(fields, "error", err)...)
 		} else {
@@ -1335,7 +1409,7 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 		// We received a valid handshake on this relay, so make sure the relay
 		// state reflects that, in case it had been marked Disestablished.
 		via.relayHI.relayState.UpdateRelayForByIdxState(via.remoteIdx, Established)
-		f.SendVia(via.relayHI, via.relay, msg, make([]byte, 12), make([]byte, mtu), false)
+		hm.writeHandshakeVia(via.relayHI, via.relay, msg)
 		f.l.Info("Handshake message sent", append(logFields, "relay", via.relayHI.vpnAddrs[0])...)
 	}
 }

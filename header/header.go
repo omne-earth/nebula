@@ -37,16 +37,22 @@ const (
 	Test        MessageType = 4
 	CloseTunnel MessageType = 5
 	Control     MessageType = 6
+	// HandshakeChunk carries one fragment of a handshake datagram too large to
+	// cross a fragment-hostile path whole (the pqIX ML-KEM flights). RemoteIndex
+	// holds the flightID; MessageCounter packs count<<8|idx. The receiver
+	// reassembles the original handshake datagram before processing it.
+	HandshakeChunk MessageType = 7
 )
 
 var typeMap = map[MessageType]string{
-	Handshake:   "handshake",
-	Message:     "message",
-	RecvError:   "recvError",
-	LightHouse:  "lightHouse",
-	Test:        "test",
-	CloseTunnel: "closeTunnel",
-	Control:     "control",
+	Handshake:      "handshake",
+	Message:        "message",
+	RecvError:      "recvError",
+	LightHouse:     "lightHouse",
+	Test:           "test",
+	CloseTunnel:    "closeTunnel",
+	Control:        "control",
+	HandshakeChunk: "handshakeChunk",
 }
 
 const (
@@ -88,7 +94,8 @@ var subTypeMap = map[MessageType]*map[MessageSubType]string{
 		HandshakeIXPSK0: "ix_psk0",
 		HandshakePQIX:   "pqix",
 	},
-	Control: &subTypeNoneMap,
+	Control:        &subTypeNoneMap,
+	HandshakeChunk: &subTypeNoneMap,
 }
 
 type H struct {

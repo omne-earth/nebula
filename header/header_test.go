@@ -77,13 +77,14 @@ func TestSubTypeName(t *testing.T) {
 func TestTypeMap(t *testing.T) {
 	// Force people to document this stuff
 	assert.Equal(t, map[MessageType]string{
-		Handshake:   "handshake",
-		Message:     "message",
-		RecvError:   "recvError",
-		LightHouse:  "lightHouse",
-		Test:        "test",
-		CloseTunnel: "closeTunnel",
-		Control:     "control",
+		Handshake:      "handshake",
+		Message:        "message",
+		RecvError:      "recvError",
+		LightHouse:     "lightHouse",
+		Test:           "test",
+		CloseTunnel:    "closeTunnel",
+		Control:        "control",
+		HandshakeChunk: "handshakeChunk",
 	}, typeMap)
 
 	assert.Equal(t, map[MessageType]*map[MessageSubType]string{
@@ -99,8 +100,58 @@ func TestTypeMap(t *testing.T) {
 			HandshakeIXPSK0: "ix_psk0",
 			HandshakePQIX:   "pqix",
 		},
-		Control: &subTypeNoneMap,
+		Control:        &subTypeNoneMap,
+		HandshakeChunk: &subTypeNoneMap,
 	}, subTypeMap)
+}
+
+// TestWireLayoutGolden pins the on-wire byte layout of the 16-byte header. If a
+// field is reordered, resized, or the packing changes, these golden bytes break
+// — a deliberate tripwire, since both ends and the chunk reassembler depend on
+// the exact layout. Update intentionally, never to make a red test pass.
+func TestWireLayoutGolden(t *testing.T) {
+	cases := []struct {
+		name string
+		h    H
+		want []byte
+	}{
+		{
+			// version=1, type=Handshake(0), pqIX subtype(2), remoteIndex, counter
+			name: "handshake_pqix",
+			h:    H{Version: 1, Type: Handshake, Subtype: HandshakePQIX, RemoteIndex: 0x01020304, MessageCounter: 1},
+			want: []byte{0x10, 0x02, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 1},
+		},
+		{
+			// HandshakeChunk(7): RemoteIndex carries flightID, MessageCounter packs
+			// count<<8|idx. Here flightID=0xAABBCCDD, count=7, idx=3 -> 0x0703.
+			name: "handshake_chunk",
+			h:    H{Version: 1, Type: HandshakeChunk, RemoteIndex: 0xAABBCCDD, MessageCounter: uint64(7)<<8 | 3},
+			want: []byte{0x17, 0x00, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0, 0, 0, 0x07, 0x03},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.h.Encode(make([]byte, Len))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got, "wire layout drift")
+
+			// Round-trips back to the same struct (Reserved is always 0 on the wire).
+			var parsed H
+			require.NoError(t, parsed.Parse(got))
+			assert.Equal(t, tc.h, parsed)
+		})
+	}
+}
+
+// TestAllTypesDocumented fails if a MessageType constant is added without a
+// typeMap entry (TypeName would return "unknown"). Catches the easy mistake of
+// wiring a new packet type into the switch but forgetting the human-name table.
+func TestAllTypesDocumented(t *testing.T) {
+	for tp := Handshake; tp <= HandshakeChunk; tp++ {
+		if _, ok := typeMap[tp]; !ok {
+			t.Errorf("MessageType %d has no typeMap entry", tp)
+		}
+	}
 }
 
 func TestHeader_String(t *testing.T) {

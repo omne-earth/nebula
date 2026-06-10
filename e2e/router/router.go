@@ -83,6 +83,17 @@ type R struct {
 	fn           string
 	cancelRender context.CancelFunc
 	t            testing.TB
+
+	// Optional packet-drop filter: if set and it returns true for a UDP packet,
+	// routeUDP silently drops it instead of injecting. Simulates a lossy or
+	// fragment-hostile path (e.g. a GCP-style edge that drops datagrams over a
+	// size). Set via SetDropFilter.
+	dropFilter func(*udp.Packet) bool
+
+	// Optional observe-only tap: called for every UDP packet routed via routeUDP,
+	// before the drop filter. Use to assert wire-level invariants (e.g. no
+	// datagram exceeds a size). Set via SetTap.
+	tap func(*udp.Packet)
 }
 
 type ignoreFlow struct {
@@ -595,10 +606,38 @@ func (r *R) routeUDP(from *nebula.Control, p *udp.Packet) {
 	if c == nil {
 		panic(fmt.Sprintf("No control for udp tx %s", p.To))
 	}
+	if r.tap != nil {
+		r.tap(p)
+	}
+	if r.dropFilter != nil && r.dropFilter(p) {
+		// Simulated path drop: do not inject, do not record as received.
+		p.Release()
+		return
+	}
 	fp := r.unlockedInjectFlow(from, c, p, false)
 	c.InjectUDPPacket(p) // copies internally; original is ours to release
 	fp.WasReceived()
 	p.Release()
+}
+
+// SetDropFilter installs a predicate consulted for every UDP packet routed via
+// routeUDP (the path taken by RouteForAllUntilTxTun and friends). If it returns
+// true the packet is silently dropped. Pass nil to clear. Used to simulate a
+// fragment-hostile or lossy edge in handshake-resilience tests.
+func (r *R) SetDropFilter(f func(*udp.Packet) bool) {
+	r.Lock()
+	defer r.Unlock()
+	r.dropFilter = f
+}
+
+// SetTap installs an observe-only hook called for every UDP packet routed via
+// routeUDP (the path taken by RouteForAllUntilTxTun and friends), before the
+// drop filter. Pass nil to clear. Used to assert wire-level invariants like a
+// maximum datagram size.
+func (r *R) SetTap(f func(*udp.Packet)) {
+	r.Lock()
+	defer r.Unlock()
+	r.tap = f
 }
 
 // selectCasesFor returns the SelectCase array used by routeReflect: one slot for the receiver's TUN TX channel followed

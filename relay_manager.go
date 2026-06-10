@@ -158,7 +158,10 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 		switch existingRelay.State {
 		case Established:
 			hl.Log(context.Background(), level, "Send handshake via relay", "relay", relay.String())
-			f.SendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false)
+			// Chunk the relayed stage0 (same invariant as the direct path): the
+			// inner ML-KEM flight is too large to relay-wrap whole without
+			// IP-fragmenting on the relay->target hop.
+			f.handshakeManager.writeHandshakeVia(relayHostInfo, existingRelay, stage0)
 		case Disestablished:
 			// Mark this relay as 'requested'
 			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, Requested)
