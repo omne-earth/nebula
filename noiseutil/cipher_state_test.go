@@ -42,7 +42,7 @@ func (fakeCipher) CipherName() string             { return "Fake" }
 // to produce a pair of post-handshake CipherStates that share keys.
 func buildCipherStates(t *testing.T, c noise.CipherFunc) (*noise.CipherState, *noise.CipherState) {
 	t.Helper()
-	suite := noise.NewCipherSuite(noise.DH25519, c, noise.HashSHA256)
+	suite := noise.NewCipherSuite(noise.DH25519, c, noise.HashSHA512)
 	cfg := noise.Config{CipherSuite: suite, Pattern: noise.HandshakeNN}
 	cfg.Initiator = true
 	hsI, err := noise.NewHandshakeState(cfg)
@@ -117,7 +117,7 @@ func benchEncryptCipherState(b *testing.B, cs CipherState) {
 
 func buildCipherStatesB(b *testing.B, c noise.CipherFunc) (*noise.CipherState, *noise.CipherState) {
 	b.Helper()
-	suite := noise.NewCipherSuite(noise.DH25519, c, noise.HashSHA256)
+	suite := noise.NewCipherSuite(noise.DH25519, c, noise.HashSHA512)
 	cfg := noise.Config{CipherSuite: suite, Pattern: noise.HandshakeNN}
 	cfg.Initiator = true
 	hsI, err := noise.NewHandshakeState(cfg)

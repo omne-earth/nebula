@@ -2,7 +2,7 @@ package nebula
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -300,7 +300,7 @@ func (f *Firewall) AddRule(incoming bool, proto uint8, startPort int32, endPort 
 
 // GetRuleHash returns a hash representation of all inbound and outbound rules
 func (f *Firewall) GetRuleHash() string {
-	sum := sha256.Sum256([]byte(f.rules))
+	sum := sha512.Sum384([]byte(f.rules))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -311,7 +311,7 @@ func (f *Firewall) GetRuleHashFNV() uint32 {
 	return h.Sum32()
 }
 
-// GetRuleHashes returns both the sha256 and FNV-1 hashes, suitable for logging
+// GetRuleHashes returns both the sha384 and FNV-1 hashes, suitable for logging
 func (f *Firewall) GetRuleHashes() string {
 	return "SHA:" + f.GetRuleHash() + ",FNV:" + strconv.FormatUint(uint64(f.GetRuleHashFNV()), 10)
 }

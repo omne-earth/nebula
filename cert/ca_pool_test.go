@@ -61,10 +61,10 @@ Tq5a8AyWDQdfXbtEZ1FwabeHfH5Asw0=
 	p256 := `
 # p256 certificate
 -----BEGIN NEBULA CERTIFICATE-----
-CmQKEG5lYnVsYSBQMjU2IHRlc3QozRwwzbjM8K8HOkEEdrmmg40zQp44AkMq6DZp
-k+coOv04r+zh33ISyhbsafnYduN17p2eD7CmHvHuerguXD9f32gcxo/KsFCKEjMe
-+0ABoAYBEkcwRQIgVoTg38L7uWku9xQgsr06kxZ/viQLOO/w1Qj1vFUEnhcCIQCq
-75SjTiV92kv/1GcbT3wWpAZQQDBiUHVMVmh1822szA==
+CmYKEG5lYnVsYSBQMjU2IHRlc3QomPWs0QYwmPvc5wc6QQS/KpCc8ar5HEPGS8S+
++srmE0cXqXgbTxv46HTe/JtXhN6EpO+1MMVUEIUinuYE1L3hott3jQMMHbBAtIJk
+kQSEQAGgBgESRjBEAiBdSHrpk1/O+TQCizxbCGCX6qsMvgJ1MEh6okr4xDH+9QIg
+EShXMMaVCx1/PRcKFFMF8gD32eGOLfiLPDaNyp1+HCA=
 -----END NEBULA CERTIFICATE-----
 `
 
@@ -88,30 +88,30 @@ k+coOv04r+zh33ISyhbsafnYduN17p2eD7CmHvHuerguXD9f32gcxo/KsFCKEjMe
 
 	p, err := NewCAPoolFromPEM([]byte(noNewLines))
 	require.NoError(t, err)
-	assert.Equal(t, p.CAs["ce4e6c7a596996eb0d82a8875f0f0137a4b53ce22d2421c9fd7150e7a26f6300"].Certificate.Name(), rootCA.details.name)
-	assert.Equal(t, p.CAs["04c585fcd9a49b276df956a22b7ebea3bf23f1fca5a17c0b56ce2e626631969e"].Certificate.Name(), rootCA01.details.name)
+	assert.Equal(t, p.CAs["b408356c5d35e437273f12e5177bf98cf7baf37653f55b8fc560c3f3022ff27e6af8a5475e70e402eb8d20b3bd3c016f"].Certificate.Name(), rootCA.details.name)
+	assert.Equal(t, p.CAs["5abd85808c4a8944f8b839aaed18039476e4a72ddb4330a71199a61106fdda61e96ab007781243c69ccb2a4fbbae5775"].Certificate.Name(), rootCA01.details.name)
 
 	pp, err := NewCAPoolFromPEM([]byte(withNewLines))
 	require.NoError(t, err)
-	assert.Equal(t, pp.CAs["ce4e6c7a596996eb0d82a8875f0f0137a4b53ce22d2421c9fd7150e7a26f6300"].Certificate.Name(), rootCA.details.name)
-	assert.Equal(t, pp.CAs["04c585fcd9a49b276df956a22b7ebea3bf23f1fca5a17c0b56ce2e626631969e"].Certificate.Name(), rootCA01.details.name)
+	assert.Equal(t, pp.CAs["b408356c5d35e437273f12e5177bf98cf7baf37653f55b8fc560c3f3022ff27e6af8a5475e70e402eb8d20b3bd3c016f"].Certificate.Name(), rootCA.details.name)
+	assert.Equal(t, pp.CAs["5abd85808c4a8944f8b839aaed18039476e4a72ddb4330a71199a61106fdda61e96ab007781243c69ccb2a4fbbae5775"].Certificate.Name(), rootCA01.details.name)
 
 	// expired cert, no valid certs
 	ppp, err := NewCAPoolFromPEM([]byte(expired))
 	assert.Equal(t, ErrExpired, err)
-	assert.Equal(t, "expired", ppp.CAs["c39b35a0e8f246203fe4f32b9aa8bfd155f1ae6a6be9d78370641e43397f48f5"].Certificate.Name())
+	assert.Equal(t, "expired", ppp.CAs["3dffd1442fa5f140aacd51da1bef420383d7832fd1330043448ef44d335ada35bc9b0b366bcf0f3cb6c83c48825b972e"].Certificate.Name())
 
 	// expired cert, with valid certs
 	pppp, err := NewCAPoolFromPEM(append([]byte(expired), noNewLines...))
 	assert.Equal(t, ErrExpired, err)
-	assert.Equal(t, pppp.CAs["ce4e6c7a596996eb0d82a8875f0f0137a4b53ce22d2421c9fd7150e7a26f6300"].Certificate.Name(), rootCA.details.name)
-	assert.Equal(t, pppp.CAs["04c585fcd9a49b276df956a22b7ebea3bf23f1fca5a17c0b56ce2e626631969e"].Certificate.Name(), rootCA01.details.name)
-	assert.Equal(t, "expired", pppp.CAs["c39b35a0e8f246203fe4f32b9aa8bfd155f1ae6a6be9d78370641e43397f48f5"].Certificate.Name())
+	assert.Equal(t, pppp.CAs["b408356c5d35e437273f12e5177bf98cf7baf37653f55b8fc560c3f3022ff27e6af8a5475e70e402eb8d20b3bd3c016f"].Certificate.Name(), rootCA.details.name)
+	assert.Equal(t, pppp.CAs["5abd85808c4a8944f8b839aaed18039476e4a72ddb4330a71199a61106fdda61e96ab007781243c69ccb2a4fbbae5775"].Certificate.Name(), rootCA01.details.name)
+	assert.Equal(t, "expired", pppp.CAs["3dffd1442fa5f140aacd51da1bef420383d7832fd1330043448ef44d335ada35bc9b0b366bcf0f3cb6c83c48825b972e"].Certificate.Name())
 	assert.Len(t, pppp.CAs, 3)
 
 	ppppp, err := NewCAPoolFromPEM([]byte(p256))
 	require.NoError(t, err)
-	assert.Equal(t, ppppp.CAs["552bf7d99bec1fc775a0e4c324bf6d8f789b3078f1919c7960d2e5e0c351ee97"].Certificate.Name(), rootCAP256.details.name)
+	assert.Equal(t, ppppp.CAs["d4c37cb7aa13386435fed5527c5b24a811861452b39befec7ad8162eb9028cd70060d09b2f208b4ccf08f32bdbb9d8d4"].Certificate.Name(), rootCAP256.details.name)
 	assert.Len(t, ppppp.CAs, 1)
 }
 

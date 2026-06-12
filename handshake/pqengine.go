@@ -2,7 +2,7 @@ package handshake
 
 import (
 	"crypto/hkdf"
-	"crypto/sha256"
+	"crypto/sha512"
 	"fmt"
 
 	"github.com/cloudflare/circl/kem"
@@ -276,45 +276,46 @@ func (e *pqEngine) readMessageStep(out, message []byte) ([]byte, noiseutil.Ciphe
 // --- symmetric state (hand-built Noise core) ------------------------------
 
 const (
-	pqProtocolName = "pqIXanalog_MLKEM1024_AESGCM_SHA256"
+	pqProtocolName = "pqIXanalog_MLKEM1024_AESGCM_SHA384"
 	gcmTagLen      = 16
 )
 
-// pqState mirrors Noise's SymmetricState: HKDF-SHA256 chaining, a SHA-256 transcript,
-// and an AES-256-GCM AEAD keyed off the chain.
+// pqState mirrors Noise's SymmetricState: HKDF-SHA384 chaining, a SHA-384 transcript,
+// and an AES-256-GCM AEAD keyed off the chain (CNSA 2.0 alignment: SHA-384 everywhere
+// a hash is ours to choose; the AEAD key stays 256-bit AES per the suite).
 type pqState struct {
-	ck     [32]byte
-	h      [32]byte
+	ck     [48]byte
+	h      [48]byte
 	k      [32]byte
 	hasKey bool
 	n      uint64
 }
 
 func newPQState() *pqState {
-	sum := sha256.Sum256([]byte(pqProtocolName))
+	sum := sha512.Sum384([]byte(pqProtocolName))
 	return &pqState{ck: sum, h: sum}
 }
 
 func (s *pqState) mixHash(data []byte) {
-	hh := sha256.New()
+	hh := sha512.New384()
 	hh.Write(s.h[:])
 	hh.Write(data)
-	var out [32]byte
+	var out [48]byte
 	hh.Sum(out[:0])
 	s.h = out
 }
 
 func (s *pqState) mixKey(ikm []byte) {
-	prk, err := hkdf.Extract(sha256.New, ikm, s.ck[:])
+	prk, err := hkdf.Extract(sha512.New384, ikm, s.ck[:])
 	if err != nil {
 		panic(err)
 	}
-	out, err := hkdf.Expand(sha256.New, prk, "", 64)
+	out, err := hkdf.Expand(sha512.New384, prk, "", 80)
 	if err != nil {
 		panic(err)
 	}
-	copy(s.ck[:], out[:32])
-	copy(s.k[:], out[32:])
+	copy(s.ck[:], out[:48])
+	copy(s.k[:], out[48:])
 	s.hasKey = true
 	s.n = 0
 }
@@ -359,11 +360,11 @@ func (s *pqState) decryptAndHash(ct []byte) ([]byte, error) {
 // split derives the two directional transport keys (i2r, r2i) from the final chaining
 // key. Both peers run this on the same ck and derive the identical pair.
 func (s *pqState) split() ([32]byte, [32]byte) {
-	prk, err := hkdf.Extract(sha256.New, []byte{}, s.ck[:])
+	prk, err := hkdf.Extract(sha512.New384, []byte{}, s.ck[:])
 	if err != nil {
 		panic(err)
 	}
-	out, err := hkdf.Expand(sha256.New, prk, "", 64)
+	out, err := hkdf.Expand(sha512.New384, prk, "", 64)
 	if err != nil {
 		panic(err)
 	}

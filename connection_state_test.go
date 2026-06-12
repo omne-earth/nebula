@@ -34,7 +34,7 @@ func runTestHandshake(t *testing.T) (initR, respR *handshake.Result) {
 		require.NoError(t, err)
 		hsBytes, err := c.MarshalForHandshakes()
 		require.NoError(t, err)
-		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA512)
 		cred := handshake.NewCredential(c, hsBytes, priv, ncs)
 		return func(v cert.Version) *handshake.Credential {
 			if v == cert.Version2 {

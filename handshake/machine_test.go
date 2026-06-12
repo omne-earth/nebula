@@ -495,7 +495,7 @@ func TestMachineExpiredCert(t *testing.T) {
 	require.NoError(t, err)
 	expHsBytes, err := expCert.MarshalForHandshakes()
 	require.NoError(t, err)
-	ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA512)
 
 	expiredCS := &testCertState{
 		version: cert.Version2,
@@ -525,7 +525,7 @@ func TestMachineNoCertNetworks(t *testing.T) {
 
 	caHsBytes, err := ca.MarshalForHandshakes()
 	require.NoError(t, err)
-	ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA512)
 
 	noNetCS := &testCertState{
 		version: cert.Version2,
@@ -592,7 +592,7 @@ func TestMachineVersionNegotiation(t *testing.T) {
 		respCertV2, _ := ct.NewTestCertDifferentVersion(respCertV1, cert.Version2, ca2, caKey2)
 		respHsV1, _ := respCertV1.MarshalForHandshakes()
 		respHsV2, _ := respCertV2.MarshalForHandshakes()
-		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA512)
 		return &testCertState{
 			version: cert.Version1,
 			creds: map[cert.Version]*Credential{
@@ -640,7 +640,7 @@ func TestMachineVersionNegotiation(t *testing.T) {
 		)
 		respKey, _, _, _ := cert.UnmarshalPrivateKeyFromPEM(respKeyPEM)
 		respHs, _ := respCert.MarshalForHandshakes()
-		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+		ncs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA512)
 		respCS := &testCertState{
 			version: cert.Version1,
 			creds: map[cert.Version]*Credential{

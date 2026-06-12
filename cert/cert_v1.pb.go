@@ -135,7 +135,7 @@ type RawNebulaCertificateDetails struct {
 	NotAfter  int64    `protobuf:"varint,6,opt,name=NotAfter,proto3" json:"NotAfter,omitempty"`
 	PublicKey []byte   `protobuf:"bytes,7,opt,name=PublicKey,proto3" json:"PublicKey,omitempty"`
 	IsCA      bool     `protobuf:"varint,8,opt,name=IsCA,proto3" json:"IsCA,omitempty"`
-	// sha-256 of the issuer certificate, if this field is blank the cert is self-signed
+	// sha-384 of the issuer certificate, if this field is blank the cert is self-signed
 	Issuer []byte `protobuf:"bytes,9,opt,name=Issuer,proto3" json:"Issuer,omitempty"`
 	Curve  Curve  `protobuf:"varint,100,opt,name=curve,proto3,enum=cert.Curve" json:"curve,omitempty"`
 }

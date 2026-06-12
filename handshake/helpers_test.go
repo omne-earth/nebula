@@ -44,7 +44,7 @@ func newTestCertStateWithCipher(
 	hsBytes, err := c.MarshalForHandshakes()
 	require.NoError(t, err)
 
-	ncs := noise.NewCipherSuite(noise.DH25519, cipher, noise.HashSHA256)
+	ncs := noise.NewCipherSuite(noise.DH25519, cipher, noise.HashSHA512)
 	return &testCertState{
 		version: cert.Version2,
 		creds: map[cert.Version]*Credential{

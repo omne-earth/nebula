@@ -5,7 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
+	"crypto/sha512"
 	"fmt"
 	"net/netip"
 	"time"
@@ -67,7 +67,7 @@ func (t *TBSCertificate) Sign(signer Certificate, curve Curve, key []byte) (Cert
 		sp := func(certBytes []byte) ([]byte, error) {
 			// We need to hash first for ECDSA
 			// - https://pkg.go.dev/crypto/ecdsa#SignASN1
-			hashed := sha256.Sum256(certBytes)
+			hashed := sha512.Sum384(certBytes)
 			return ecdsa.SignASN1(rand.Reader, pk, hashed[:])
 		}
 		return t.SignWith(signer, curve, sp)

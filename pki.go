@@ -259,9 +259,9 @@ func newCipherSuite(curve cert.Curve, pkcs11backed bool, cipher string) (noise.C
 	}
 
 	if cipher == "chachapoly" {
-		return noise.NewCipherSuite(dhFunc, noise.CipherChaChaPoly, noise.HashSHA256), nil
+		return noise.NewCipherSuite(dhFunc, noise.CipherChaChaPoly, noise.HashSHA512), nil
 	}
-	return noise.NewCipherSuite(dhFunc, noiseutil.CipherAESGCM, noise.HashSHA256), nil
+	return noise.NewCipherSuite(dhFunc, noiseutil.CipherAESGCM, noise.HashSHA512), nil
 }
 
 func (cs *CertState) String() string {

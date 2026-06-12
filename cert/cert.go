@@ -74,7 +74,7 @@ type Certificate interface {
 	// computed signature. A true result means this certificate has not been tampered with.
 	CheckSignature(signingPublicKey []byte) bool
 
-	// Fingerprint returns the hex encoded sha256 sum of the certificate.
+	// Fingerprint returns the hex encoded sha384 sum of the certificate.
 	// This acts as a unique fingerprint and can be used to blocklist certificates.
 	Fingerprint() (string, error)
 

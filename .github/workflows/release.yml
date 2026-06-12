@@ -185,7 +185,7 @@ jobs:
           cp windows-arm64/* .
           zip -r nebula-windows-arm64.zip nebula.exe nebula-cert.exe dist
 
-      - name: Create sha256sum
+      - name: Create sha384sum
         run: |
           cd artifacts
           for dir in linux-latest darwin-latest windows-latest
@@ -194,26 +194,26 @@ jobs:
               cd $dir
               if [ "$dir" = windows-latest ]
               then
-                sha256sum <windows-amd64/nebula.exe | sed 's=-$=nebula-windows-amd64.zip/nebula.exe='
-                sha256sum <windows-amd64/nebula-cert.exe | sed 's=-$=nebula-windows-amd64.zip/nebula-cert.exe='
-                sha256sum <windows-arm64/nebula.exe | sed 's=-$=nebula-windows-arm64.zip/nebula.exe='
-                sha256sum <windows-arm64/nebula-cert.exe | sed 's=-$=nebula-windows-arm64.zip/nebula-cert.exe='
-                sha256sum nebula-windows-amd64.zip
-                sha256sum nebula-windows-arm64.zip
+                sha384sum <windows-amd64/nebula.exe | sed 's=-$=nebula-windows-amd64.zip/nebula.exe='
+                sha384sum <windows-amd64/nebula-cert.exe | sed 's=-$=nebula-windows-amd64.zip/nebula-cert.exe='
+                sha384sum <windows-arm64/nebula.exe | sed 's=-$=nebula-windows-arm64.zip/nebula.exe='
+                sha384sum <windows-arm64/nebula-cert.exe | sed 's=-$=nebula-windows-arm64.zip/nebula-cert.exe='
+                sha384sum nebula-windows-amd64.zip
+                sha384sum nebula-windows-arm64.zip
               elif [ "$dir" = darwin-latest ]
               then
-                sha256sum <nebula-darwin.zip | sed 's=-$=nebula-darwin.zip='
-                sha256sum <nebula | sed 's=-$=nebula-darwin.zip/nebula='
-                sha256sum <nebula-cert | sed 's=-$=nebula-darwin.zip/nebula-cert='
+                sha384sum <nebula-darwin.zip | sed 's=-$=nebula-darwin.zip='
+                sha384sum <nebula | sed 's=-$=nebula-darwin.zip/nebula='
+                sha384sum <nebula-cert | sed 's=-$=nebula-darwin.zip/nebula-cert='
               else
                 for v in *.tar.gz
                 do
-                  sha256sum $v
-                  tar zxf $v --to-command='sh -c "sha256sum | sed s=-$='$v'/$TAR_FILENAME="'
+                  sha384sum $v
+                  tar zxf $v --to-command='sh -c "sha384sum | sed s=-$='$v'/$TAR_FILENAME="'
                 done
               fi
             )
-          done | sort -k 2 >SHASUM256.txt
+          done | sort -k 2 >SHASUM384.txt
 
       - name: Create Release
         id: create_release
@@ -226,4 +226,4 @@ jobs:
             --verify-tag \
             --title "Release ${GITHUB_REF_NAME}" \
             "${GITHUB_REF_NAME}" \
-            SHASUM256.txt *-latest/*.zip *-latest/*.tar.gz
+            SHASUM384.txt *-latest/*.zip *-latest/*.tar.gz

@@ -146,7 +146,7 @@ func (c *PKClient) listDeriveKeys(id []byte, label []byte, private bool) {
 
 // SignASN1 signs some data. Returns the ASN.1 encoded signature.
 func (c *PKClient) SignASN1(data []byte) ([]byte, error) {
-	mech := pkcs11.NewMechanism(pkcs11.CKM_ECDSA_SHA256, nil)
+	mech := pkcs11.NewMechanism(pkcs11.CKM_ECDSA_SHA384, nil)
 	sk := p11.PrivateKey(c.privKeyObj)
 	rawSig, err := sk.Sign(*mech, data)
 	if err != nil {

@@ -5,10 +5,13 @@ package sshd
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 
 	"github.com/slackhq/nebula/control"
 	"golang.org/x/crypto/ssh"
@@ -59,7 +62,7 @@ func NewSSHServer(ctx context.Context, l *slog.Logger, reg *control.Registry) (*
 		},
 		UserKeyFallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			pk := string(pubKey.Marshal())
-			fp := ssh.FingerprintSHA256(pubKey)
+			fp := fingerprintSHA384(pubKey)
 
 			tk, ok := s.trustedKeys[c.User()]
 			if !ok {
@@ -245,4 +248,11 @@ func (s *SSHServer) Stop() {
 			s.l.Warn("Failed to close the sshd listener", "error", err)
 		}
 	}
+}
+
+// fingerprintSHA384 renders a public key fingerprint in the OpenSSH style but at the
+// SHA-384 floor (x/crypto/ssh ships no helper at or above it; >=384 is the repo-wide bar).
+func fingerprintSHA384(pubKey ssh.PublicKey) string {
+	sum := sha512.Sum384(pubKey.Marshal())
+	return "SHA384:" + strings.TrimRight(base64.StdEncoding.EncodeToString(sum[:]), "=")
 }

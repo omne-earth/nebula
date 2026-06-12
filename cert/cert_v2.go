@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -136,7 +136,7 @@ func (c *certificateV2) Fingerprint() (string, error) {
 	b[len(c.rawDetails)] = byte(c.curve)
 	copy(b[len(c.rawDetails)+1:], c.publicKey)
 	copy(b[len(c.rawDetails)+1+len(c.publicKey):], c.signature)
-	sum := sha256.Sum256(b)
+	sum := sha512.Sum384(b)
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -160,7 +160,7 @@ func (c *certificateV2) CheckSignature(key []byte) bool {
 		if err != nil {
 			return false
 		}
-		hashed := sha256.Sum256(b)
+		hashed := sha512.Sum384(b)
 		return ecdsa.VerifyASN1(pubKey, hashed[:], c.signature)
 	case Curve_MLKEM1024, Curve_MLDSA87:
 		// Both post-quantum cert kinds are signed by an ML-DSA-87 CA; key is that

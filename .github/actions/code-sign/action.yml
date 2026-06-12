@@ -108,6 +108,6 @@ runs:
                 exit 1
             fi
 
-            echo "Signed ${rel} (sha256=$(jq -r '.sha256' /tmp/sign-resp.json), status=${status})"
+            echo "Signed ${rel} (status=${status})"
             echo "::endgroup::"
         done

@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -101,7 +101,7 @@ func (c *certificateV1) Fingerprint() (string, error) {
 		return "", err
 	}
 
-	sum := sha256.Sum256(b)
+	sum := sha512.Sum384(b)
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -121,7 +121,7 @@ func (c *certificateV1) CheckSignature(key []byte) bool {
 		if err != nil {
 			return false
 		}
-		hashed := sha256.Sum256(b)
+		hashed := sha512.Sum384(b)
 		return ecdsa.VerifyASN1(pubKey, hashed[:], c.signature)
 	default:
 		return false
